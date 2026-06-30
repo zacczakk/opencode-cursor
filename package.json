@@ -4,15 +4,23 @@
   "description": "OpenCode plugin that connects Cursor's API to OpenCode via OAuth, model discovery, and a local OpenAI-compatible proxy.",
   "license": "MIT",
   "type": "module",
-  "main": "./dist/index.js",
-  "module": "./dist/index.js",
-  "types": "./dist/index.d.ts",
+  "main": "./dist/plugin.js",
+  "module": "./dist/plugin.js",
+  "types": "./dist/plugin.d.ts",
   "exports": {
     ".": {
-      "types": "./dist/index.d.ts",
-      "import": "./dist/index.js",
-      "default": "./dist/index.js"
+      "types": "./dist/plugin.d.ts",
+      "import": "./dist/plugin.js",
+      "default": "./dist/plugin.js"
+    },
+    "./standalone": {
+      "types": "./dist/standalone.d.ts",
+      "import": "./dist/standalone.js",
+      "default": "./dist/standalone.js"
     }
+  },
+  "bin": {
+    "cursor-oauth-proxy": "./dist/standalone.js"
   },
   "files": [
     "dist"
