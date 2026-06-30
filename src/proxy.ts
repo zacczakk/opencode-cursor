@@ -370,11 +370,65 @@ export async function startProxy(
     ? Number(process.env.CURSOR_PROXY_PORT)
     : 0;
 
-  proxyServer = Bun.serve({
-    port: fixedPort,
-    idleTimeout: 255, // max — Cursor responses can take 30s+
-    async fetch(req) {
+  // Reuse an already-running cursor-oauth proxy on the same fixed port (e.g. a
+  // second opencode window, or a standalone `serve`). Without this, the second
+  // starter hits EADDRINUSE and errors. Only reuse if /health confirms it's OURS.
+  if (fixedPort) {
+    const existing = await probeHealth(fixedPort);
+    if (existing) {
+      proxyPort = fixedPort;
+      proxyServer = undefined; // we don't own it; never stop() someone else's server
+      return fixedPort;
+    }
+  }
+
+  const fetchHandler = makeFetchHandler();
+  try {
+    proxyServer = Bun.serve({ port: fixedPort, idleTimeout: 255, fetch: fetchHandler });
+  } catch (err: any) {
+    // Lost a startup race: someone bound the port between our probe and serve.
+    if (fixedPort && (err?.code === "EADDRINUSE" || /in use|EADDRINUSE/i.test(String(err?.message)))) {
+      const existing = await probeHealth(fixedPort);
+      if (existing) {
+        proxyPort = fixedPort;
+        proxyServer = undefined;
+        return fixedPort;
+      }
+    }
+    throw err;
+  }
+
+  proxyPort = proxyServer.port;
+  if (!proxyPort) throw new Error("Failed to bind proxy to a port");
+  return proxyPort;
+}
+
+/** GET /health on a candidate port: true iff it's a live cursor-oauth proxy. */
+async function probeHealth(port: number): Promise<boolean> {
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}/health`, {
+      signal: AbortSignal.timeout(1500),
+    });
+    if (!res.ok) return false;
+    const body = (await res.json().catch(() => null)) as { proxy?: string } | null;
+    return body?.proxy === "cursor-oauth";
+  } catch {
+    return false;
+  }
+}
+
+/** Build the request handler (shared by fresh server + reuse path). */
+function makeFetchHandler() {
+  return async (req: Request): Promise<Response> => {
+    {
       const url = new URL(req.url);
+
+      if (req.method === "GET" && url.pathname === "/health") {
+        return new Response(
+          JSON.stringify({ proxy: "cursor-oauth", models: proxyModels.length }),
+          { headers: { "Content-Type": "application/json" } },
+        );
+      }
 
       if (req.method === "GET" && url.pathname === "/v1/models") {
         return new Response(
@@ -387,13 +441,26 @@ export async function startProxy(
       }
 
       if (req.method === "POST" && url.pathname === "/v1/chat/completions") {
+        const reqStart = Date.now();
         try {
           const body = (await req.json()) as ChatCompletionRequest;
           if (!proxyAccessTokenProvider) {
             throw new Error("Cursor proxy access token provider not configured");
           }
           const accessToken = await proxyAccessTokenProvider();
-          return handleChatCompletion(body, accessToken);
+          if (process.env.CURSOR_PROXY_DEBUG) {
+            const sysLen = body.messages.filter((m) => m.role === "system")
+              .reduce((n, m) => n + (typeof m.content === "string" ? m.content.length : 0), 0);
+            console.error(
+              `[proxy] REQ model=${body.model} stream=${body.stream} msgs=${body.messages.length} ` +
+              `sys=${sysLen}ch tools=${body.tools?.length ?? 0} tokenWait=${Date.now() - reqStart}ms`,
+            );
+          }
+          const resp = await handleChatCompletion(body, accessToken);
+          if (process.env.CURSOR_PROXY_DEBUG) {
+            console.error(`[proxy] RESP headers-sent in ${Date.now() - reqStart}ms (streaming continues after)`);
+          }
+          return resp;
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
           return new Response(
@@ -406,12 +473,8 @@ export async function startProxy(
       }
 
       return new Response("Not Found", { status: 404 });
-    },
-  });
-
-  proxyPort = proxyServer.port;
-  if (!proxyPort) throw new Error("Failed to bind proxy to a port");
-  return proxyPort;
+    }
+  };
 }
 
 export function stopProxy(): void {
