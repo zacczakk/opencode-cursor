@@ -364,8 +364,14 @@ export async function startProxy(
   }));
   if (proxyServer && proxyPort) return proxyPort;
 
+  // Fixed port when CURSOR_PROXY_PORT is set (standalone mode); 0 = ephemeral
+  // (plugin/loader mode, where the port is handed back to opencode in-process).
+  const fixedPort = process.env.CURSOR_PROXY_PORT
+    ? Number(process.env.CURSOR_PROXY_PORT)
+    : 0;
+
   proxyServer = Bun.serve({
-    port: 0,
+    port: fixedPort,
     idleTimeout: 255, // max — Cursor responses can take 30s+
     async fetch(req) {
       const url = new URL(req.url);
