@@ -24,7 +24,19 @@ export const KEYCHAIN_ACCOUNT = "cursor-user";
 export const KEYCHAIN_ACCESS_SERVICE = "cursor-access-token";
 export const KEYCHAIN_REFRESH_SERVICE = "cursor-refresh-token";
 export const PROVIDER_ID = "cursor-oauth";
+export const PROVIDER_NAME = "Cursor";
 export const DEFAULT_PORT = 32125; // avoid @rama_nigg/open-cursor's 32124
+
+/**
+ * Models to SHOW in opencode's selector, comma-separated, via env CURSOR_MODELS.
+ * Empty/unset = show all discovered models. The proxy always SERVES every model
+ * regardless — this only filters what the provider block advertises.
+ */
+export function shownModelIds(): string[] | null {
+  const raw = (process.env.CURSOR_MODELS ?? "").trim();
+  if (!raw) return null;
+  return raw.split(",").map((s) => s.trim()).filter(Boolean);
+}
 
 /** Read a secret from the macOS Keychain. Returns null if unavailable. */
 async function readKeychain(service: string): Promise<string | null> {
@@ -107,11 +119,16 @@ export function buildProviderBlock(
   port: number,
   models: Array<{ id: string; name: string }>,
 ): Record<string, unknown> {
+  const show = shownModelIds();
+  const filtered = show ? models.filter((m) => show.includes(m.id)) : models;
+  // If the allow-list matched nothing (e.g. typo), fall back to all so the
+  // provider is never empty.
+  const finalModels = filtered.length > 0 ? filtered : models;
   return {
-    name: "Cursor (OAuth, direct)",
+    name: PROVIDER_NAME,
     npm: "@ai-sdk/openai-compatible",
     options: { baseURL: `http://127.0.0.1:${port}/v1`, apiKey: "unused" },
-    models: Object.fromEntries(models.map((m) => [m.id, { name: m.name }])),
+    models: Object.fromEntries(finalModels.map((m) => [m.id, { name: m.name }])),
   };
 }
 
