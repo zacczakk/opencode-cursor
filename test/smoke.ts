@@ -524,6 +524,46 @@ async function testDiscoveryFallbackAndSuccess(
   console.log("[test] Discovery fallback and success OK");
 }
 
+async function testFixedPortReuse(modules: TestModules) {
+  // Regression: EADDRINUSE "Failed to start server. Is port 32125 in use?".
+  // A second startProxy call on the SAME fixed port must REUSE the running
+  // proxy (confirmed via /health), not try to re-bind and throw. This is the
+  // crash the plugin surfaced whenever more than one opencode instance loaded.
+  console.log("[test] Testing fixed-port reuse (no EADDRINUSE)...");
+  const prev = process.env.CURSOR_PROXY_PORT;
+  // Pick a high, almost-certainly-free fixed port for the test.
+  const fixed = 39217;
+  process.env.CURSOR_PROXY_PORT = String(fixed);
+  try {
+    const first = await modules.startProxy(async () => "test-token");
+    assertEqual(first, fixed, "First start should bind the requested fixed port");
+
+    // Simulate a SECOND, independent starter by clearing the in-process global
+    // singleton, then starting again on the same fixed port. Without the
+    // health-reuse path this second call throws EADDRINUSE.
+    const g = globalThis as unknown as Record<string, unknown>;
+    const saved = g["__cursorOauthProxy__"];
+    g["__cursorOauthProxy__"] = {}; // force the "fresh module copy" code path
+
+    const second = await modules.startProxy(async () => "test-token");
+    assertEqual(second, fixed, "Second start must REUSE the fixed port, not throw");
+
+    // Restore the real singleton so stopProxy() below tears down the server.
+    g["__cursorOauthProxy__"] = saved;
+
+    const health = await fetch(`http://127.0.0.1:${fixed}/health`);
+    assertEqual(health.status, 200, "Reused proxy /health should answer 200");
+    const body = (await health.json()) as { proxy?: string };
+    assertEqual(body.proxy, "cursor-oauth", "/health must identify as cursor-oauth");
+
+    modules.stopProxy();
+    console.log("[test] Fixed-port reuse OK");
+  } finally {
+    if (prev === undefined) delete process.env.CURSOR_PROXY_PORT;
+    else process.env.CURSOR_PROXY_PORT = prev;
+  }
+}
+
 async function main() {
   const backend = await createTestCursorBackend();
   process.env.CURSOR_API_URL = backend.apiUrl;
@@ -533,6 +573,7 @@ async function main() {
 
   try {
     await testProxyStartStop(modules);
+    await testFixedPortReuse(modules);
     await testAuthParams(modules);
     await testTokenExpiry(modules);
     await testPluginShape(modules);

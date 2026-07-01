@@ -330,8 +330,23 @@ export async function callCursorUnaryRpc(
   return promise;
 }
 
-let proxyServer: ReturnType<typeof Bun.serve> | undefined;
-let proxyPort: number | undefined;
+// Proxy singleton anchored on globalThis, NOT module scope. opencode can load a
+// plugin more than once (auto-discovery from BOTH ~/.config/opencode/plugin/ and
+// plugins/, plus any npm `plugin[]` entry) — each load is a SEPARATE module copy
+// with its own module-scoped variables. A module-scoped singleton would then let
+// two copies each try to Bun.serve the same fixed port: the first binds, the
+// second hits EADDRINUSE. Storing the server on globalThis makes every copy in
+// the same process share one instance, so the second load is a no-op reuse.
+interface CursorProxyGlobal {
+  server?: ReturnType<typeof Bun.serve>;
+  port?: number;
+}
+const PROXY_GLOBAL_KEY = "__cursorOauthProxy__";
+function proxyGlobal(): CursorProxyGlobal {
+  const g = globalThis as unknown as Record<string, CursorProxyGlobal | undefined>;
+  return (g[PROXY_GLOBAL_KEY] ??= {});
+}
+
 let proxyAccessTokenProvider: (() => Promise<string>) | undefined;
 let proxyModels: Array<{ id: string; name: string }> = [];
 
@@ -350,7 +365,7 @@ function buildOpenAIModelList(models: ReadonlyArray<{ id: string; name: string }
 }
 
 export function getProxyPort(): number | undefined {
-  return proxyPort;
+  return proxyGlobal().port;
 }
 
 export async function startProxy(
@@ -362,7 +377,9 @@ export async function startProxy(
     id: model.id,
     name: model.name,
   }));
-  if (proxyServer && proxyPort) return proxyPort;
+
+  const state = proxyGlobal();
+  if (state.server && state.port) return state.port;
 
   // Fixed port when CURSOR_PROXY_PORT is set (standalone mode); 0 = ephemeral
   // (plugin/loader mode, where the port is handed back to opencode in-process).
@@ -370,37 +387,53 @@ export async function startProxy(
     ? Number(process.env.CURSOR_PROXY_PORT)
     : 0;
 
-  // Reuse an already-running cursor-oauth proxy on the same fixed port (e.g. a
-  // second opencode window, or a standalone `serve`). Without this, the second
-  // starter hits EADDRINUSE and errors. Only reuse if /health confirms it's OURS.
+  // Reuse an already-running cursor-oauth proxy on the same fixed port (another
+  // opencode window, a standalone `serve`, or a second copy of this plugin). The
+  // probe retries briefly: a racing starter may have bound the socket a
+  // millisecond ago but not yet wired its fetch handler, in which case /health
+  // answers Bun's default until the handler attaches. Only adopt on a CONFIRMED
+  // cursor-oauth health response.
   if (fixedPort) {
-    const existing = await probeHealth(fixedPort);
-    if (existing) {
-      proxyPort = fixedPort;
-      proxyServer = undefined; // we don't own it; never stop() someone else's server
+    if (await probeHealthWithRetry(fixedPort)) {
+      state.port = fixedPort;
+      state.server = undefined; // we don't own it; never stop() someone else's server
       return fixedPort;
     }
   }
 
   const fetchHandler = makeFetchHandler();
   try {
-    proxyServer = Bun.serve({ port: fixedPort, idleTimeout: 255, fetch: fetchHandler });
+    state.server = Bun.serve({ port: fixedPort, idleTimeout: 255, fetch: fetchHandler });
   } catch (err: any) {
-    // Lost a startup race: someone bound the port between our probe and serve.
-    if (fixedPort && (err?.code === "EADDRINUSE" || /in use|EADDRINUSE/i.test(String(err?.message)))) {
-      const existing = await probeHealth(fixedPort);
-      if (existing) {
-        proxyPort = fixedPort;
-        proxyServer = undefined;
+    const inUse =
+      err?.code === "EADDRINUSE" || /in use|EADDRINUSE/i.test(String(err?.message));
+    if (fixedPort && inUse) {
+      // Lost the startup race: someone bound the port between our probe and serve.
+      // If it's a healthy cursor-oauth proxy, adopt it.
+      if (await probeHealthWithRetry(fixedPort)) {
+        state.port = fixedPort;
+        state.server = undefined;
         return fixedPort;
       }
+      // The port is held by something that is NOT our proxy (a foreign squatter,
+      // or a half-dead bind that never answers /health). Rather than hard-fail
+      // the plugin — which leaves opencode with no Cursor provider at all — bind
+      // an EPHEMERAL port instead. The bound port flows into the provider block,
+      // so this window still works; it just doesn't share the fixed port.
+      console.error(
+        `[cursor-oauth] port ${fixedPort} is held by a non-cursor-oauth process; ` +
+        `falling back to an ephemeral port for this instance`,
+      );
+      state.server = Bun.serve({ port: 0, idleTimeout: 255, fetch: fetchHandler });
+    } else {
+      throw err;
     }
-    throw err;
   }
 
-  proxyPort = proxyServer.port;
-  if (!proxyPort) throw new Error("Failed to bind proxy to a port");
-  return proxyPort;
+  const bound = state.server.port;
+  if (!bound) throw new Error("Failed to bind proxy to a port");
+  state.port = bound;
+  return bound;
 }
 
 /** GET /health on a candidate port: true iff it's a live cursor-oauth proxy. */
@@ -415,6 +448,24 @@ async function probeHealth(port: number): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+/**
+ * probeHealth with a few quick retries. Covers the narrow race where a competing
+ * starter has just bound the socket but not yet attached its fetch handler (so
+ * /health momentarily returns Bun's default page). Returns true as soon as any
+ * attempt confirms a cursor-oauth proxy; false if none do within the budget.
+ */
+async function probeHealthWithRetry(
+  port: number,
+  attempts = 3,
+  delayMs = 150,
+): Promise<boolean> {
+  for (let i = 0; i < attempts; i++) {
+    if (await probeHealth(port)) return true;
+    if (i < attempts - 1) await new Promise((r) => setTimeout(r, delayMs));
+  }
+  return false;
 }
 
 /** Build the request handler (shared by fresh server + reuse path). */
@@ -478,10 +529,11 @@ function makeFetchHandler() {
 }
 
 export function stopProxy(): void {
-  if (proxyServer) {
-    proxyServer.stop();
-    proxyServer = undefined;
-    proxyPort = undefined;
+  const state = proxyGlobal();
+  if (state.server) {
+    state.server.stop();
+    state.server = undefined;
+    state.port = undefined;
     proxyAccessTokenProvider = undefined;
     proxyModels = [];
   }
