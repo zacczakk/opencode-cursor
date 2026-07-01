@@ -13,6 +13,7 @@ interface TestModules {
   startProxy: typeof import("../src/proxy").startProxy;
   stopProxy: typeof import("../src/proxy").stopProxy;
   getProxyPort: typeof import("../src/proxy").getProxyPort;
+  deriveConversationKey: typeof import("../src/proxy").deriveConversationKey;
   generateCursorAuthParams: typeof import("../src/auth").generateCursorAuthParams;
   getTokenExpiry: typeof import("../src/auth").getTokenExpiry;
   CursorAuthPlugin: typeof import("../src/index").CursorAuthPlugin;
@@ -216,6 +217,7 @@ async function loadModules(): Promise<TestModules> {
     startProxy: proxy.startProxy,
     stopProxy: proxy.stopProxy,
     getProxyPort: proxy.getProxyPort,
+    deriveConversationKey: proxy.deriveConversationKey,
     generateCursorAuthParams: auth.generateCursorAuthParams,
     getTokenExpiry: auth.getTokenExpiry,
     CursorAuthPlugin: index.CursorAuthPlugin,
@@ -564,6 +566,54 @@ async function testFixedPortReuse(modules: TestModules) {
   }
 }
 
+async function testConversationKeyIsolation(modules: TestModules) {
+  // Regression: session title showed "[Error: Connect error internal: Blob not
+  // found]". opencode's title-generation replays the session's FIRST user
+  // message under a tiny "Generate a title" system prompt. deriveConversationKey
+  // keyed on first-user-text ALONE, so the title call collided onto the chat's
+  // deterministic conversationId and hit a server-side conversation whose
+  // root-prompt blob it never sent. Distinct system prompts must yield distinct
+  // conversation keys.
+  console.log("[test] Testing conversation-key isolation (title vs chat)...");
+  const firstUser = "help me refactor the auth module and fix the failing tests";
+
+  const chat = [
+    { role: "system", content: "You are opencode, a large coding agent. [huge system prompt...]" },
+    { role: "user", content: firstUser },
+  ] as any;
+  const title = [
+    { role: "system", content: "Generate a short title for this conversation. Reply with the title only." },
+    { role: "user", content: firstUser },
+  ] as any;
+
+  const chatKey = modules.deriveConversationKey(chat);
+  const titleKey = modules.deriveConversationKey(title);
+  assert(
+    chatKey !== titleKey,
+    `Title and chat must not share a conversation key (both got ${chatKey})`,
+  );
+
+  // Same system prompt + same first user message across follow-up turns MUST
+  // still map to one conversation (preserves server-side context reuse).
+  const turn1 = [
+    { role: "system", content: "You are opencode, a large coding agent. [huge system prompt...]" },
+    { role: "user", content: firstUser },
+  ] as any;
+  const turn2 = [
+    { role: "system", content: "You are opencode, a large coding agent. [huge system prompt...]" },
+    { role: "user", content: firstUser },
+    { role: "assistant", content: "Sure, let's start." },
+    { role: "user", content: "now run the tests" },
+  ] as any;
+  assertEqual(
+    modules.deriveConversationKey(turn1),
+    modules.deriveConversationKey(turn2),
+    "Follow-up turns in the same chat must keep one conversation key",
+  );
+
+  console.log("[test] Conversation-key isolation OK");
+}
+
 async function main() {
   const backend = await createTestCursorBackend();
   process.env.CURSOR_API_URL = backend.apiUrl;
@@ -574,6 +624,7 @@ async function main() {
   try {
     await testProxyStartStop(modules);
     await testFixedPortReuse(modules);
+    await testConversationKeyIsolation(modules);
     await testAuthParams(modules);
     await testTokenExpiry(modules);
     await testPluginShape(modules);

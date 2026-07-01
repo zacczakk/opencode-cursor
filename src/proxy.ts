@@ -1234,17 +1234,40 @@ function deriveBridgeKey(modelId: string, messages: OpenAIMessage[]): string {
   const firstUserMsg = messages.find((m) => m.role === "user");
   const firstUserText = firstUserMsg ? textContent(firstUserMsg.content) : "";
   return createHash("sha256")
-    .update(`bridge:${modelId}:${firstUserText.slice(0, 200)}`)
+    .update(`bridge:${modelId}:${systemPromptFingerprint(messages)}:${firstUserText.slice(0, 200)}`)
     .digest("hex")
     .slice(0, 16);
 }
 
-/** Derive a key for conversation state. Model-independent so context survives model switches. */
-function deriveConversationKey(messages: OpenAIMessage[]): string {
+/**
+ * Fingerprint the system prompt so conversations with the SAME first user
+ * message but DIFFERENT system prompts don't collide onto one server-side
+ * Cursor conversation. The classic collision: opencode's title-generation
+ * side-call replays the session's first user message under a tiny "Generate a
+ * title" system prompt. Keyed on first-user-text alone, that shared the main
+ * chat's deterministic conversationId — so the title request hit a server
+ * conversation whose root-prompt blob it never sent, yielding
+ * "Connect error internal: Blob not found". Within a real chat the system
+ * prompt is stable across turns, so folding it in preserves context reuse.
+ */
+function systemPromptFingerprint(messages: OpenAIMessage[]): string {
+  const systemPrompt = messages
+    .filter((m) => m.role === "system")
+    .map((m) => textContent(m.content))
+    .join("\n");
+  return createHash("sha256").update(systemPrompt).digest("hex").slice(0, 16);
+}
+
+/** Derive a key for conversation state. Model-independent so context survives
+ *  model switches, but system-prompt-aware so a title-gen side-call (same first
+ *  user message, different system prompt) gets its own conversation instead of
+ *  colliding onto the chat's server-side state (which triggers "Blob not found").
+ */
+export function deriveConversationKey(messages: OpenAIMessage[]): string {
   const firstUserMsg = messages.find((m) => m.role === "user");
   const firstUserText = firstUserMsg ? textContent(firstUserMsg.content) : "";
   return createHash("sha256")
-    .update(`conv:${firstUserText.slice(0, 200)}`)
+    .update(`conv:${systemPromptFingerprint(messages)}:${firstUserText.slice(0, 200)}`)
     .digest("hex")
     .slice(0, 16);
 }
@@ -1586,6 +1609,7 @@ async function collectFullResponse(
     totalTokens: 0,
   };
   const tagFilter = createThinkingTagFilter();
+  let endStreamError: Error | null = null;
 
   bridge.onData(createConnectFrameParser(
     (messageBytes) => {
@@ -1618,7 +1642,9 @@ async function collectFullResponse(
         // Skip
       }
     },
-    () => {},
+    (endStreamBytes) => {
+      endStreamError = parseConnectEndStream(endStreamBytes);
+    },
   ));
 
   bridge.onClose(() => {
@@ -1630,6 +1656,12 @@ async function collectFullResponse(
     }
     const flushed = tagFilter.flush();
     fullText += flushed.content;
+
+    // Surface a real upstream error instead of silently returning an empty
+    // body (which would otherwise become a blank title / empty completion).
+    if (endStreamError && !fullText) {
+      fullText = `[Error: ${endStreamError.message}]`;
+    }
 
     const usage = computeUsage(state);
     resolve({
