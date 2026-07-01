@@ -661,11 +661,84 @@ async function testConversationIdProcessUniqueness(modules: TestModules) {
   console.log("[test] Conversation-ID process uniqueness OK");
 }
 
+async function testProxyVersionGuardEvictsOlder(modules: TestModules) {
+  // Regression: a fresh plugin build must be able to TAKE OVER the fixed port
+  // from an OLDER cursor-oauth proxy still running there (a stale opencode window
+  // from before a rebuild). Before the version guard, startProxy adopted ANY
+  // healthy cursor-oauth proxy on the port, so new plugin code never loaded until
+  // every old window was killed — the "restart didn't help" trap. Here we stand
+  // up a fake OLDER proxy (buildEpoch=1) and confirm the real startProxy evicts
+  // it via POST /shutdown and binds the port itself.
+  console.log("[test] Testing proxy version guard (evict older)...");
+  const PORT = 39160;
+
+  let shutdownCalledWithEpoch = -1;
+  let released = false;
+  let fake: ReturnType<typeof Bun.serve> | null = null;
+  fake = Bun.serve({
+    port: PORT,
+    idleTimeout: 30,
+    fetch: async (req) => {
+      const url = new URL(req.url);
+      if (url.pathname === "/health") {
+        if (released) return new Response("gone", { status: 503 });
+        return new Response(JSON.stringify({ proxy: "cursor-oauth", models: 0, buildEpoch: 1 }), {
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      if (req.method === "POST" && url.pathname === "/shutdown") {
+        const body = (await req.json().catch(() => null)) as { buildEpoch?: number } | null;
+        shutdownCalledWithEpoch = body?.buildEpoch ?? -1;
+        released = true;
+        // Actually release the socket, as the real proxy's stopProxy() does, so
+        // the reclaiming proxy can bind. Defer so this response flushes first.
+        setTimeout(() => { try { fake?.stop(true); } catch { /* noop */ } }, 20);
+        return new Response(JSON.stringify({ ok: true, releasing: true }), {
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      return new Response("not found", { status: 404 });
+    },
+  });
+
+  const prevPort = process.env.CURSOR_PROXY_PORT;
+  process.env.CURSOR_PROXY_PORT = String(PORT);
+  try {
+    // Real startProxy: its BUILD_EPOCH (source mtime) is far newer than 1, so it
+    // must evict the fake via POST /shutdown, wait for the port to free, then
+    // bind it. It must NOT simply adopt the epoch=1 proxy.
+    const boundPort = await modules.startProxy(async () => "test-token", [
+      { id: "composer-2.5", name: "composer-2.5" },
+    ]);
+
+    assert(
+      shutdownCalledWithEpoch > 1,
+      `startProxy must POST /shutdown with its (newer) epoch; got ${shutdownCalledWithEpoch}`,
+    );
+    assertEqual(boundPort, PORT, "startProxy should bind the fixed port after evicting the older proxy");
+
+    // The port must now be served by OUR proxy (real /v1/models works).
+    const res = await fetch(`http://127.0.0.1:${PORT}/v1/models`);
+    assert(res.ok, `/v1/models on reclaimed port returned ${res.status}`);
+    const body = (await res.json()) as { object?: string };
+    assertEqual(body.object, "list", "reclaimed proxy must serve /v1/models");
+
+    modules.stopProxy();
+  } finally {
+    try { fake.stop(true); } catch { /* already stopped */ }
+    if (prevPort === undefined) delete process.env.CURSOR_PROXY_PORT;
+    else process.env.CURSOR_PROXY_PORT = prevPort;
+  }
+
+  console.log("[test] Proxy version guard OK");
+}
+
 async function main() {
   // Hermetic tests: never adopt a live cursor-oauth proxy (e.g. a running
   // opencode window on CURSOR_PROXY_PORT). Force ephemeral ports so startProxy
   // always binds its OWN server with the test's model list — otherwise
   // /v1/models returns the live catalog and the empty-list assertion fails.
+  // (testProxyVersionGuardEvictsOlder sets/restores it locally.)
   delete process.env.CURSOR_PROXY_PORT;
 
   const backend = await createTestCursorBackend();
@@ -679,6 +752,7 @@ async function main() {
     await testFixedPortReuse(modules);
     await testConversationKeyIsolation(modules);
     await testConversationIdProcessUniqueness(modules);
+    await testProxyVersionGuardEvictsOlder(modules);
     await testAuthParams(modules);
     await testTokenExpiry(modules);
     await testPluginShape(modules);

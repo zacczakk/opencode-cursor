@@ -68,10 +68,32 @@ import {
 } from "./proto/agent_pb";
 import { createHash } from "node:crypto";
 import { resolve as pathResolve } from "node:path";
+import { statSync } from "node:fs";
 
 const CURSOR_API_URL = process.env.CURSOR_API_URL ?? "https://api2.cursor.sh";
 const CONNECT_END_STREAM_FLAG = 0b00000010;
 const BRIDGE_PATH = pathResolve(import.meta.dir, "h2-bridge.mjs");
+
+/** Build stamp = mtime (ms) of THIS module's own file. A freshly-rebuilt proxy
+ *  has a newer mtime, so it can detect — and evict — an OLDER proxy squatting the
+ *  fixed port (a still-running opencode window from before the rebuild). Without
+ *  this, `startProxy` adopts ANY healthy cursor-oauth proxy on the port, so a new
+ *  window silently reuses stale in-memory plugin code and a fix never takes
+ *  effect until every old window is killed. See probeHealth / requestProxyEviction.
+ *  Falls back to 0 (never wins an eviction race) if the self-stat fails. */
+const BUILD_EPOCH: number = (() => {
+  try {
+    return Math.floor(statSync(pathResolve(import.meta.dir, "proxy.js")).mtimeMs);
+  } catch {
+    try {
+      // Dev/source run (bun src/proxy.ts): no compiled proxy.js next to us.
+      return Math.floor(statSync(new URL(import.meta.url).pathname).mtimeMs);
+    } catch {
+      return 0;
+    }
+  }
+})();
+
 const SSE_HEADERS = {
   "Content-Type": "text/event-stream",
   "Cache-Control": "no-cache",
@@ -392,12 +414,30 @@ export async function startProxy(
   // probe retries briefly: a racing starter may have bound the socket a
   // millisecond ago but not yet wired its fetch handler, in which case /health
   // answers Bun's default until the handler attaches. Only adopt on a CONFIRMED
-  // cursor-oauth health response.
+  // cursor-oauth health response — AND only if it is not OLDER than us. If the
+  // running proxy predates this build (stale opencode window from before a
+  // rebuild), evict it and bind ourselves so the fix actually takes effect.
   if (fixedPort) {
-    if (await probeHealthWithRetry(fixedPort)) {
-      state.port = fixedPort;
-      state.server = undefined; // we don't own it; never stop() someone else's server
-      return fixedPort;
+    const health = await probeHealthWithRetry(fixedPort);
+    if (health.ok) {
+      if (health.buildEpoch >= BUILD_EPOCH) {
+        state.port = fixedPort;
+        state.server = undefined; // we don't own it; never stop() someone else's server
+        return fixedPort;
+      }
+      // Running proxy is older → take over the port.
+      const evicted = await requestProxyEviction(fixedPort);
+      if (!evicted) {
+        // It refused or wouldn't let go; adopt it rather than leave opencode with
+        // no provider. (Worst case: still stale, same as before this guard.)
+        console.error(
+          `[cursor-oauth] older proxy on ${fixedPort} did not release; adopting it`,
+        );
+        state.port = fixedPort;
+        state.server = undefined;
+        return fixedPort;
+      }
+      // Port is free now; fall through to bind our fresh server below.
     }
   }
 
@@ -409,11 +449,25 @@ export async function startProxy(
       err?.code === "EADDRINUSE" || /in use|EADDRINUSE/i.test(String(err?.message));
     if (fixedPort && inUse) {
       // Lost the startup race: someone bound the port between our probe and serve.
-      // If it's a healthy cursor-oauth proxy, adopt it.
-      if (await probeHealthWithRetry(fixedPort)) {
+      // If it's a healthy cursor-oauth proxy that is not older than us, adopt it;
+      // if it's older, evict and retry the bind once.
+      const health = await probeHealthWithRetry(fixedPort);
+      if (health.ok && health.buildEpoch >= BUILD_EPOCH) {
         state.port = fixedPort;
         state.server = undefined;
         return fixedPort;
+      }
+      if (health.ok && health.buildEpoch < BUILD_EPOCH && (await requestProxyEviction(fixedPort))) {
+        try {
+          state.server = Bun.serve({ port: fixedPort, idleTimeout: 255, fetch: fetchHandler });
+          const rebound = state.server.port;
+          if (rebound) {
+            state.port = rebound;
+            return rebound;
+          }
+        } catch {
+          // fall through to ephemeral
+        }
       }
       // The port is held by something that is NOT our proxy (a foreign squatter,
       // or a half-dead bind that never answers /health). Rather than hard-fail
@@ -436,34 +490,71 @@ export async function startProxy(
   return bound;
 }
 
-/** GET /health on a candidate port: true iff it's a live cursor-oauth proxy. */
-async function probeHealth(port: number): Promise<boolean> {
+interface ProxyHealth {
+  /** True iff the port answered a cursor-oauth /health. */
+  ok: boolean;
+  /** The running proxy's build stamp (0 if it predates the stamp field). */
+  buildEpoch: number;
+}
+
+/** GET /health on a candidate port. Reports whether it's a live cursor-oauth
+ *  proxy and, if so, its build stamp. */
+async function probeHealth(port: number): Promise<ProxyHealth> {
   try {
     const res = await fetch(`http://127.0.0.1:${port}/health`, {
       signal: AbortSignal.timeout(1500),
     });
-    if (!res.ok) return false;
-    const body = (await res.json().catch(() => null)) as { proxy?: string } | null;
-    return body?.proxy === "cursor-oauth";
+    if (!res.ok) return { ok: false, buildEpoch: 0 };
+    const body = (await res.json().catch(() => null)) as
+      | { proxy?: string; buildEpoch?: number }
+      | null;
+    if (body?.proxy !== "cursor-oauth") return { ok: false, buildEpoch: 0 };
+    return { ok: true, buildEpoch: typeof body.buildEpoch === "number" ? body.buildEpoch : 0 };
   } catch {
-    return false;
+    return { ok: false, buildEpoch: 0 };
   }
 }
 
 /**
  * probeHealth with a few quick retries. Covers the narrow race where a competing
  * starter has just bound the socket but not yet attached its fetch handler (so
- * /health momentarily returns Bun's default page). Returns true as soon as any
- * attempt confirms a cursor-oauth proxy; false if none do within the budget.
+ * /health momentarily returns Bun's default page). Returns the confirmed health
+ * as soon as any attempt succeeds; a non-ok health if none do within the budget.
  */
 async function probeHealthWithRetry(
   port: number,
   attempts = 3,
   delayMs = 150,
-): Promise<boolean> {
+): Promise<ProxyHealth> {
+  let last: ProxyHealth = { ok: false, buildEpoch: 0 };
   for (let i = 0; i < attempts; i++) {
-    if (await probeHealth(port)) return true;
+    last = await probeHealth(port);
+    if (last.ok) return last;
     if (i < attempts - 1) await new Promise((r) => setTimeout(r, delayMs));
+  }
+  return last;
+}
+
+/** Ask an OLDER proxy on `port` to release it (POST /shutdown with our epoch).
+ *  Returns true once the port is free (the old proxy stopped and no cursor-oauth
+ *  /health answers anymore). Best-effort: false if it refused or didn't let go. */
+async function requestProxyEviction(port: number): Promise<boolean> {
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}/shutdown`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ buildEpoch: BUILD_EPOCH }),
+      signal: AbortSignal.timeout(1500),
+    });
+    if (!res.ok) return false;
+  } catch {
+    return false;
+  }
+  // Poll until the old server has actually stopped answering (its setTimeout
+  // stop + socket teardown take a beat).
+  for (let i = 0; i < 20; i++) {
+    await new Promise((r) => setTimeout(r, 100));
+    if (!(await probeHealth(port)).ok) return true;
   }
   return false;
 }
@@ -476,8 +567,34 @@ function makeFetchHandler() {
 
       if (req.method === "GET" && url.pathname === "/health") {
         return new Response(
-          JSON.stringify({ proxy: "cursor-oauth", models: proxyModels.length }),
+          JSON.stringify({ proxy: "cursor-oauth", models: proxyModels.length, buildEpoch: BUILD_EPOCH }),
           { headers: { "Content-Type": "application/json" } },
+        );
+      }
+
+      // Control endpoint: a NEWER proxy asks this (older) one to release the port.
+      // Authorized ONLY if the caller's buildEpoch is strictly greater than ours,
+      // so a stale opencode window can't evict a fresh one, and randoms can't kill
+      // the proxy. On success we stop our server; the caller then binds the port.
+      if (req.method === "POST" && url.pathname === "/shutdown") {
+        let callerEpoch = 0;
+        try {
+          const body = (await req.json().catch(() => null)) as { buildEpoch?: number } | null;
+          callerEpoch = typeof body?.buildEpoch === "number" ? body.buildEpoch : 0;
+        } catch { /* callerEpoch stays 0 */ }
+        if (callerEpoch > BUILD_EPOCH) {
+          console.error(
+            `[cursor-oauth] evicted by newer build (${callerEpoch} > ${BUILD_EPOCH}); releasing port`,
+          );
+          // Defer stop so this response flushes first.
+          setTimeout(() => stopProxy(), 50);
+          return new Response(JSON.stringify({ ok: true, releasing: true }), {
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+        return new Response(
+          JSON.stringify({ ok: false, buildEpoch: BUILD_EPOCH, reason: "caller not newer" }),
+          { status: 409, headers: { "Content-Type": "application/json" } },
         );
       }
 
@@ -750,6 +867,13 @@ function buildCursorRequest(
     createHash("sha256").update(systemBytes).digest(),
   );
   blobStore.set(Buffer.from(systemBlobId).toString("hex"), systemBytes);
+
+  if (process.env.CURSOR_PROXY_DEBUG_BLOB) {
+    console.error(
+      `[blob] buildRequest: systemBlobId=${Buffer.from(systemBlobId).toString("hex").slice(0, 16)}` +
+        ` checkpoint=${checkpoint ? "YES" : "no"} incomingStore=${(existingBlobStore?.size ?? 0)} sysPromptLen=${systemPrompt.length}`,
+    );
+  }
 
   let conversationState;
   if (checkpoint) {
@@ -1039,6 +1163,12 @@ function handleKvMessage(
     const blobId = kvMsg.message.value.blobId;
     const blobIdKey = Buffer.from(blobId).toString("hex");
     const blobData = blobStore.get(blobIdKey);
+    if (process.env.CURSOR_PROXY_DEBUG_BLOB) {
+      console.error(
+        `[blob] getBlob ${blobIdKey.slice(0, 16)} → ${blobData ? `HIT (${blobData.length}b)` : "MISS"}` +
+          ` | store has ${blobStore.size} blob(s): [${[...blobStore.keys()].map((k) => k.slice(0, 16)).join(", ")}]`,
+      );
+    }
     sendKvResponse(
       kvMsg, "getBlobResult",
       create(GetBlobResultSchema, blobData ? { blobData } : {}),
@@ -1047,6 +1177,9 @@ function handleKvMessage(
   } else if (kvCase === "setBlobArgs") {
     const { blobId, blobData } = kvMsg.message.value;
     blobStore.set(Buffer.from(blobId).toString("hex"), blobData);
+    if (process.env.CURSOR_PROXY_DEBUG_BLOB) {
+      console.error(`[blob] setBlob ${Buffer.from(blobId).toString("hex").slice(0, 16)} (${blobData.length}b)`);
+    }
     sendKvResponse(
       kvMsg, "setBlobResult",
       create(SetBlobResultSchema, {}),
@@ -1672,6 +1805,9 @@ async function collectFullResponse(
     // Surface a real upstream error instead of silently returning an empty
     // body (which would otherwise become a blank title / empty completion).
     if (endStreamError && !fullText) {
+      if (process.env.CURSOR_PROXY_DEBUG_BLOB) {
+        console.error(`[blob] end-stream error became content: ${endStreamError.message}`);
+      }
       fullText = `[Error: ${endStreamError.message}]`;
     }
 
