@@ -596,7 +596,7 @@ function handleChatCompletion(
   let stored = conversationStates.get(convKey);
   if (!stored) {
     stored = {
-      conversationId: deterministicConversationId(convKey),
+      conversationId: deriveConversationId(convKey),
       checkpoint: null,
       blobStore: new Map(),
       lastAccessMs: Date.now(),
@@ -1245,7 +1245,7 @@ function deriveBridgeKey(modelId: string, messages: OpenAIMessage[]): string {
  * Cursor conversation. The classic collision: opencode's title-generation
  * side-call replays the session's first user message under a tiny "Generate a
  * title" system prompt. Keyed on first-user-text alone, that shared the main
- * chat's deterministic conversationId — so the title request hit a server
+ * chat's conversation key — so the title request hit a server
  * conversation whose root-prompt blob it never sent, yielding
  * "Connect error internal: Blob not found". Within a real chat the system
  * prompt is stable across turns, so folding it in preserves context reuse.
@@ -1272,11 +1272,23 @@ export function deriveConversationKey(messages: OpenAIMessage[]): string {
     .slice(0, 16);
 }
 
-/** Deterministic UUID derived from convKey so Cursor's server-side conversation
- *  persists across proxy restarts. Formats 16 bytes of SHA-256 as a v4-shaped UUID. */
-function deterministicConversationId(convKey: string): string {
+/** Per-process salt so conversation IDs are unique to THIS proxy run. A prior
+ *  design made the ID a pure function of convKey to "persist the server-side
+ *  conversation across proxy restarts" — but the local state needed to actually
+ *  continue it (blobStore + checkpoint in `conversationStates`) is memory-only
+ *  and dies on restart. Reusing the server-side ID without the blobs it expects
+ *  is what produced "Connect error internal: Blob not found": Cursor's KV
+ *  handshake asks for a prior-turn blob the freshly-started proxy never re-sent.
+ *  Salting per process guarantees every conversation we start is one whose blobs
+ *  we fully own. Stable WITHIN a run (multi-turn + model-switch reuse via
+ *  `conversationStates`), unique ACROSS runs. */
+const PROCESS_CONVERSATION_SALT = crypto.randomUUID();
+
+/** UUID derived from convKey + per-process salt. v4-shaped. Unique per proxy
+ *  run, stable within it — see PROCESS_CONVERSATION_SALT. */
+export function deriveConversationId(convKey: string): string {
   const hex = createHash("sha256")
-    .update(`cursor-conv-id:${convKey}`)
+    .update(`cursor-conv-id:${PROCESS_CONVERSATION_SALT}:${convKey}`)
     .digest("hex")
     .slice(0, 32);
   // Format as UUID: xxxxxxxx-xxxx-4xxx-Nxxx-xxxxxxxxxxxx

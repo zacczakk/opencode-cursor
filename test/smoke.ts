@@ -14,6 +14,7 @@ interface TestModules {
   stopProxy: typeof import("../src/proxy").stopProxy;
   getProxyPort: typeof import("../src/proxy").getProxyPort;
   deriveConversationKey: typeof import("../src/proxy").deriveConversationKey;
+  deriveConversationId: typeof import("../src/proxy").deriveConversationId;
   generateCursorAuthParams: typeof import("../src/auth").generateCursorAuthParams;
   getTokenExpiry: typeof import("../src/auth").getTokenExpiry;
   CursorAuthPlugin: typeof import("../src/index").CursorAuthPlugin;
@@ -218,6 +219,7 @@ async function loadModules(): Promise<TestModules> {
     stopProxy: proxy.stopProxy,
     getProxyPort: proxy.getProxyPort,
     deriveConversationKey: proxy.deriveConversationKey,
+    deriveConversationId: proxy.deriveConversationId,
     generateCursorAuthParams: auth.generateCursorAuthParams,
     getTokenExpiry: auth.getTokenExpiry,
     CursorAuthPlugin: index.CursorAuthPlugin,
@@ -614,7 +616,58 @@ async function testConversationKeyIsolation(modules: TestModules) {
   console.log("[test] Conversation-key isolation OK");
 }
 
+async function testConversationIdProcessUniqueness(modules: TestModules) {
+  // Regression: "Connect error internal: Blob not found" persisted even after
+  // the system-prompt-fingerprint fix. Root cause: the conversation ID was a
+  // pure function of convKey, so it was STABLE ACROSS PROXY RESTARTS. But the
+  // local blobStore + checkpoint needed to continue that server-side
+  // conversation live in an in-memory Map that dies on restart. A freshly
+  // started proxy reused the old server-side conversation ID, Cursor's KV
+  // handshake asked for a prior-turn blob the new proxy never re-sent, and
+  // Cursor returned "Blob not found". The ID must be unique per proxy process.
+  console.log("[test] Testing conversation-ID process uniqueness...");
+  const convKey = "fixedconvkey1234";
+
+  // Stable WITHIN a process (multi-turn + model-switch reuse depends on this).
+  const a = modules.deriveConversationId(convKey);
+  const b = modules.deriveConversationId(convKey);
+  assertEqual(a, b, "conversationId must be stable within one proxy process");
+
+  // v4-shaped UUID.
+  assert(
+    /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(a),
+    `conversationId must be a v4-shaped UUID, got ${a}`,
+  );
+
+  // A SEPARATE proxy process (simulating a restart) MUST derive a different ID
+  // for the same convKey — otherwise it adopts a server-side conversation whose
+  // blobs it doesn't have. Spawn a fresh bun process that imports the proxy.
+  const script =
+    `const p = await import("${new URL("../src/proxy.ts", import.meta.url).pathname}");` +
+    `process.stdout.write(p.deriveConversationId(${JSON.stringify(convKey)}));`;
+  const proc = Bun.spawn(["bun", "-e", script], { stdout: "pipe", stderr: "pipe" });
+  const otherProcessId = (await new Response(proc.stdout).text()).trim();
+  const code = await proc.exited;
+  assert(
+    code === 0 && otherProcessId.length > 0,
+    `failed to derive conversationId in a second process (exit ${code}, err: ${await new Response(proc.stderr).text()})`,
+  );
+  assert(
+    otherProcessId !== a,
+    `A restarted proxy must NOT reuse the conversation ID (both got ${a}) — ` +
+      `that is the "Blob not found" regression`,
+  );
+
+  console.log("[test] Conversation-ID process uniqueness OK");
+}
+
 async function main() {
+  // Hermetic tests: never adopt a live cursor-oauth proxy (e.g. a running
+  // opencode window on CURSOR_PROXY_PORT). Force ephemeral ports so startProxy
+  // always binds its OWN server with the test's model list — otherwise
+  // /v1/models returns the live catalog and the empty-list assertion fails.
+  delete process.env.CURSOR_PROXY_PORT;
+
   const backend = await createTestCursorBackend();
   process.env.CURSOR_API_URL = backend.apiUrl;
   process.env.CURSOR_REFRESH_URL = backend.refreshUrl;
@@ -625,6 +678,7 @@ async function main() {
     await testProxyStartStop(modules);
     await testFixedPortReuse(modules);
     await testConversationKeyIsolation(modules);
+    await testConversationIdProcessUniqueness(modules);
     await testAuthParams(modules);
     await testTokenExpiry(modules);
     await testPluginShape(modules);
