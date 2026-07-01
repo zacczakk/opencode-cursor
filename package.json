@@ -32,11 +32,11 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/ephraimduncan/opencode-cursor.git"
+    "url": "git+https://github.com/zacczakk/opencode-cursor.git"
   },
-  "homepage": "https://github.com/ephraimduncan/opencode-cursor#readme",
+  "homepage": "https://github.com/zacczakk/opencode-cursor#readme",
   "bugs": {
-    "url": "https://github.com/ephraimduncan/opencode-cursor/issues"
+    "url": "https://github.com/zacczakk/opencode-cursor/issues"
   },
   "keywords": [
     "opencode",
