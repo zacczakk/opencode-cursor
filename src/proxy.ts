@@ -428,6 +428,17 @@ export async function startProxy(
       // Running proxy is older → take over the port.
       const evicted = await requestProxyEviction(fixedPort);
       if (!evicted) {
+        try {
+          const fetchHandler = makeFetchHandler();
+          state.server = Bun.serve({ port: fixedPort, idleTimeout: 255, fetch: fetchHandler });
+          const rebound = state.server.port;
+          if (rebound) {
+            state.port = rebound;
+            return rebound;
+          }
+        } catch {
+          // still genuinely occupied; fall through to optimistic adopt
+        }
         // It refused or wouldn't let go; adopt it rather than leave opencode with
         // no provider. (Worst case: still stale, same as before this guard.)
         console.error(

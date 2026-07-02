@@ -873,6 +873,113 @@ async function testProxyVersionGuardEvictsOlder(modules: TestModules) {
   console.log("[test] Proxy version guard OK");
 }
 
+function proxyState(): { server?: ReturnType<typeof Bun.serve>; port?: number } {
+  const globals = globalThis as unknown as Record<string, { server?: ReturnType<typeof Bun.serve>; port?: number } | undefined>;
+  return globals.__cursorOauthProxy__ ?? {};
+}
+
+async function testSlowDrainEvictionBindsAfterPollTimeout(modules: TestModules) {
+  console.log("[test] Testing slow-drain eviction retry-bind...");
+  const PORT = 39161;
+
+  let shutdownCalledWithEpoch = -1;
+  let healthAfterShutdown = 0;
+  let fake: ReturnType<typeof Bun.serve> | null = null;
+  fake = Bun.serve({
+    port: PORT,
+    idleTimeout: 30,
+    fetch: async (req) => {
+      const url = new URL(req.url);
+      if (url.pathname === "/health") {
+        if (shutdownCalledWithEpoch > 0) {
+          healthAfterShutdown += 1;
+          if (healthAfterShutdown === 20) {
+            try { fake?.stop(); } catch { /* noop */ }
+          }
+        }
+        return new Response(JSON.stringify({ proxy: "cursor-oauth", models: 0, buildEpoch: 1 }), {
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      if (req.method === "POST" && url.pathname === "/shutdown") {
+        const body = (await req.json().catch(() => null)) as { buildEpoch?: number } | null;
+        shutdownCalledWithEpoch = body?.buildEpoch ?? -1;
+        return new Response(JSON.stringify({ ok: true, releasing: true }), {
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      return new Response("not found", { status: 404 });
+    },
+  });
+
+  const prevPort = process.env.CURSOR_PROXY_PORT;
+  process.env.CURSOR_PROXY_PORT = String(PORT);
+  try {
+    const boundPort = await modules.startProxy(async () => "test-token", [
+      { id: "composer-2.5", name: "composer-2.5" },
+    ]);
+
+    assert(shutdownCalledWithEpoch > 1, `startProxy must request shutdown; got ${shutdownCalledWithEpoch}`);
+    assertEqual(boundPort, PORT, "startProxy should bind the fixed port after delayed release");
+    assert(proxyState().server, "startProxy must own a real server after slow-drain eviction, not phantom-adopt");
+
+    modules.stopProxy();
+  } finally {
+    try { fake?.stop(); } catch { /* already stopped */ }
+    if (prevPort === undefined) delete process.env.CURSOR_PROXY_PORT;
+    else process.env.CURSOR_PROXY_PORT = prevPort;
+  }
+
+  console.log("[test] Slow-drain eviction retry-bind OK");
+}
+
+async function testStuckEvictionStillAdopts(modules: TestModules) {
+  console.log("[test] Testing stuck eviction fallback adopt...");
+  const PORT = 39162;
+
+  let shutdownCalledWithEpoch = -1;
+  const fake = Bun.serve({
+    port: PORT,
+    idleTimeout: 30,
+    fetch: async (req) => {
+      const url = new URL(req.url);
+      if (url.pathname === "/health") {
+        return new Response(JSON.stringify({ proxy: "cursor-oauth", models: 0, buildEpoch: 1 }), {
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      if (req.method === "POST" && url.pathname === "/shutdown") {
+        const body = (await req.json().catch(() => null)) as { buildEpoch?: number } | null;
+        shutdownCalledWithEpoch = body?.buildEpoch ?? -1;
+        return new Response(JSON.stringify({ ok: true, releasing: true }), {
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      return new Response("not found", { status: 404 });
+    },
+  });
+
+  const prevPort = process.env.CURSOR_PROXY_PORT;
+  process.env.CURSOR_PROXY_PORT = String(PORT);
+  try {
+    const boundPort = await modules.startProxy(async () => "test-token", [
+      { id: "composer-2.5", name: "composer-2.5" },
+    ]);
+
+    assert(shutdownCalledWithEpoch > 1, `startProxy must request shutdown; got ${shutdownCalledWithEpoch}`);
+    assertEqual(boundPort, PORT, "startProxy should keep the fixed port when stuck proxy is adopted");
+    assertEqual(proxyState().server, undefined, "stuck old proxy should still use optimistic adopt fallback");
+
+    modules.stopProxy();
+  } finally {
+    try { fake.stop(); } catch { /* already stopped */ }
+    if (prevPort === undefined) delete process.env.CURSOR_PROXY_PORT;
+    else process.env.CURSOR_PROXY_PORT = prevPort;
+  }
+
+  console.log("[test] Stuck eviction fallback adopt OK");
+}
+
 async function main() {
   // Hermetic tests: never adopt a live cursor-oauth proxy (e.g. a running
   // opencode window on CURSOR_PROXY_PORT). Force ephemeral ports so startProxy
@@ -895,6 +1002,8 @@ async function main() {
     await testCheckpointlessContinuedTurnBlobsAreStored(modules);
     await testConversationIdProcessUniqueness(modules);
     await testProxyVersionGuardEvictsOlder(modules);
+    await testSlowDrainEvictionBindsAfterPollTimeout(modules);
+    await testStuckEvictionStillAdopts(modules);
     await testAuthParams(modules);
     await testTokenExpiry(modules);
     await testPluginShape(modules);
