@@ -179,6 +179,28 @@ interface StoredConversation {
 const conversationStates = new Map<string, StoredConversation>();
 const CONVERSATION_TTL_MS = 30 * 60 * 1000; // 30 minutes
 
+function getOrCreateStoredConversation(convKey: string): StoredConversation {
+  let stored = conversationStates.get(convKey);
+  if (!stored) {
+    stored = {
+      conversationId: crypto.randomUUID(),
+      checkpoint: null,
+      blobStore: new Map(),
+      lastAccessMs: Date.now(),
+    };
+    conversationStates.set(convKey, stored);
+  }
+  return stored;
+}
+
+export function getStoredConversationIdForTest(convKey: string): string {
+  return getOrCreateStoredConversation(convKey).conversationId;
+}
+
+export function evictStoredConversationForTest(convKey: string): void {
+  conversationStates.delete(convKey);
+}
+
 function evictStaleConversations(): void {
   const now = Date.now();
   for (const [key, stored] of conversationStates) {
@@ -721,16 +743,7 @@ function handleChatCompletion(
     activeBridges.delete(bridgeKey);
   }
 
-  let stored = conversationStates.get(convKey);
-  if (!stored) {
-    stored = {
-      conversationId: deriveConversationId(convKey),
-      checkpoint: null,
-      blobStore: new Map(),
-      lastAccessMs: Date.now(),
-    };
-    conversationStates.set(convKey, stored);
-  }
+  const stored = getOrCreateStoredConversation(convKey);
   stored.lastAccessMs = Date.now();
   evictStaleConversations();
 
@@ -1421,35 +1434,6 @@ export function deriveConversationKey(messages: OpenAIMessage[]): string {
     .update(`conv:${systemPromptFingerprint(messages)}:${firstUserText.slice(0, 200)}`)
     .digest("hex")
     .slice(0, 16);
-}
-
-/** Per-process salt so conversation IDs are unique to THIS proxy run. A prior
- *  design made the ID a pure function of convKey to "persist the server-side
- *  conversation across proxy restarts" — but the local state needed to actually
- *  continue it (blobStore + checkpoint in `conversationStates`) is memory-only
- *  and dies on restart. Reusing the server-side ID without the blobs it expects
- *  is what produced "Connect error internal: Blob not found": Cursor's KV
- *  handshake asks for a prior-turn blob the freshly-started proxy never re-sent.
- *  Salting per process guarantees every conversation we start is one whose blobs
- *  we fully own. Stable WITHIN a run (multi-turn + model-switch reuse via
- *  `conversationStates`), unique ACROSS runs. */
-const PROCESS_CONVERSATION_SALT = crypto.randomUUID();
-
-/** UUID derived from convKey + per-process salt. v4-shaped. Unique per proxy
- *  run, stable within it — see PROCESS_CONVERSATION_SALT. */
-export function deriveConversationId(convKey: string): string {
-  const hex = createHash("sha256")
-    .update(`cursor-conv-id:${PROCESS_CONVERSATION_SALT}:${convKey}`)
-    .digest("hex")
-    .slice(0, 32);
-  // Format as UUID: xxxxxxxx-xxxx-4xxx-Nxxx-xxxxxxxxxxxx
-  return [
-    hex.slice(0, 8),
-    hex.slice(8, 12),
-    `4${hex.slice(13, 16)}`,
-    `${(0x8 | (parseInt(hex[16], 16) & 0x3)).toString(16)}${hex.slice(17, 20)}`,
-    hex.slice(20, 32),
-  ].join("-");
 }
 
 /** Create an SSE streaming Response that reads from a live bridge. */

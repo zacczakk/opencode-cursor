@@ -18,7 +18,8 @@ interface TestModules {
   stopProxy: typeof import("../src/proxy").stopProxy;
   getProxyPort: typeof import("../src/proxy").getProxyPort;
   deriveConversationKey: typeof import("../src/proxy").deriveConversationKey;
-  deriveConversationId: typeof import("../src/proxy").deriveConversationId;
+  getStoredConversationIdForTest: typeof import("../src/proxy").getStoredConversationIdForTest;
+  evictStoredConversationForTest: typeof import("../src/proxy").evictStoredConversationForTest;
   buildCursorRequestForTest: typeof import("../src/proxy").buildCursorRequestForTest;
   generateCursorAuthParams: typeof import("../src/auth").generateCursorAuthParams;
   getTokenExpiry: typeof import("../src/auth").getTokenExpiry;
@@ -230,7 +231,8 @@ async function loadModules(): Promise<TestModules> {
     stopProxy: proxy.stopProxy,
     getProxyPort: proxy.getProxyPort,
     deriveConversationKey: proxy.deriveConversationKey,
-    deriveConversationId: proxy.deriveConversationId,
+    getStoredConversationIdForTest: proxy.getStoredConversationIdForTest,
+    evictStoredConversationForTest: proxy.evictStoredConversationForTest,
     buildCursorRequestForTest: proxy.buildCursorRequestForTest,
     generateCursorAuthParams: auth.generateCursorAuthParams,
     getTokenExpiry: auth.getTokenExpiry,
@@ -756,35 +758,37 @@ async function testCheckpointlessContinuedTurnBlobsAreStored(modules: TestModule
   console.log("[test] Checkpointless continued-turn blob storage OK");
 }
 
-async function testConversationIdProcessUniqueness(modules: TestModules) {
-  // Regression: "Connect error internal: Blob not found" persisted even after
-  // the system-prompt-fingerprint fix. Root cause: the conversation ID was a
-  // pure function of convKey, so it was STABLE ACROSS PROXY RESTARTS. But the
-  // local blobStore + checkpoint needed to continue that server-side
-  // conversation live in an in-memory Map that dies on restart. A freshly
-  // started proxy reused the old server-side conversation ID, Cursor's KV
-  // handshake asked for a prior-turn blob the new proxy never re-sent, and
-  // Cursor returned "Blob not found". The ID must be unique per proxy process.
-  console.log("[test] Testing conversation-ID process uniqueness...");
+async function testConversationIdScopedToStoredConversationLifetime(modules: TestModules) {
+  // Regression: the shared proxy evicts idle StoredConversation entries after a
+  // TTL sweep triggered by any opencode window. A deterministic ID derived from
+  // convKey meant the next request recreated an empty local blobStore/checkpoint
+  // under the SAME Cursor-side conversation ID. Cursor still had advanced
+  // server-side state for that ID, asked for blobs the new local store did not
+  // have, and returned "Blob not found". IDs must be stable only while the
+  // StoredConversation entry survives, then freshly minted after eviction.
+  console.log("[test] Testing conversation-ID StoredConversation lifetime scope...");
   const convKey = "fixedconvkey1234";
 
-  // Stable WITHIN a process (multi-turn + model-switch reuse depends on this).
-  const a = modules.deriveConversationId(convKey);
-  const b = modules.deriveConversationId(convKey);
-  assertEqual(a, b, "conversationId must be stable within one proxy process");
+  const a = modules.getStoredConversationIdForTest(convKey);
+  const b = modules.getStoredConversationIdForTest(convKey);
+  assertEqual(a, b, "conversationId must stay stable while StoredConversation is alive");
 
-  // v4-shaped UUID.
   assert(
     /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(a),
     `conversationId must be a v4-shaped UUID, got ${a}`,
   );
 
-  // A SEPARATE proxy process (simulating a restart) MUST derive a different ID
-  // for the same convKey — otherwise it adopts a server-side conversation whose
-  // blobs it doesn't have. Spawn a fresh bun process that imports the proxy.
+  modules.evictStoredConversationForTest(convKey);
+  const afterEviction = modules.getStoredConversationIdForTest(convKey);
+  assert(
+    afterEviction !== a,
+    `An evicted StoredConversation must mint a fresh conversation ID (both got ${a}) — ` +
+      `that is the "Blob not found" regression`,
+  );
+
   const script =
     `const p = await import("${new URL("../src/proxy.ts", import.meta.url).pathname}");` +
-    `process.stdout.write(p.deriveConversationId(${JSON.stringify(convKey)}));`;
+    `process.stdout.write(p.getStoredConversationIdForTest(${JSON.stringify(convKey)}));`;
   const proc = Bun.spawn(["bun", "-e", script], { stdout: "pipe", stderr: "pipe" });
   const otherProcessId = (await new Response(proc.stdout).text()).trim();
   const code = await proc.exited;
@@ -798,7 +802,7 @@ async function testConversationIdProcessUniqueness(modules: TestModules) {
       `that is the "Blob not found" regression`,
   );
 
-  console.log("[test] Conversation-ID process uniqueness OK");
+  console.log("[test] Conversation-ID StoredConversation lifetime scope OK");
 }
 
 async function testProxyVersionGuardEvictsOlder(modules: TestModules) {
@@ -1000,7 +1004,7 @@ async function main() {
     await testConversationKeyIsolation(modules);
     await testTitlePriorTurnBlobsAreStored(modules);
     await testCheckpointlessContinuedTurnBlobsAreStored(modules);
-    await testConversationIdProcessUniqueness(modules);
+    await testConversationIdScopedToStoredConversationLifetime(modules);
     await testProxyVersionGuardEvictsOlder(modules);
     await testSlowDrainEvictionBindsAfterPollTimeout(modules);
     await testStuckEvictionStillAdopts(modules);
