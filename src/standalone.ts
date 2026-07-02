@@ -124,6 +124,12 @@ export function buildProviderBlock(
   // If the allow-list matched nothing (e.g. typo), fall back to all so the
   // provider is never empty.
   const finalModels = filtered.length > 0 ? filtered : models;
+  if (show && filtered.length === 0) {
+    console.error(
+      `[cursor-oauth] CURSOR_MODELS allow-list matched no discovered models (${show.join(",")}); ` +
+        `showing all ${models.length} models instead`,
+    );
+  }
   return {
     name: PROVIDER_NAME,
     npm: "@ai-sdk/openai-compatible",

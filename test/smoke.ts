@@ -11,7 +11,7 @@ import {
   ModelDetailsSchema,
 } from "../src/proto/agent_pb";
 
-type DiscoveryMode = "success" | "empty" | "auth-error";
+type DiscoveryMode = "success" | "empty" | "auth-error" | "transient-empty";
 
 interface TestModules {
   startProxy: typeof import("../src/proxy").startProxy;
@@ -78,6 +78,7 @@ function frameConnectUnaryMessage(payload: Uint8Array): Buffer {
 
 async function createTestCursorBackend(): Promise<TestCursorBackend> {
   let discoveryMode: DiscoveryMode = "success";
+  let transientFailuresRemaining = 0;
   let discoveredModels: Array<{ id: string; name: string; reasoning?: boolean }> = [
     { id: "composer-2", name: "Composer 2", reasoning: true },
   ];
@@ -146,7 +147,9 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
           return;
         }
 
-        const responseBody = discoveryMode === "empty"
+        const shouldReturnEmpty = discoveryMode === "empty" || transientFailuresRemaining > 0;
+        if (transientFailuresRemaining > 0) transientFailuresRemaining -= 1;
+        const responseBody = shouldReturnEmpty
           ? frameConnectUnaryMessage(new Uint8Array())
           : frameConnectUnaryMessage(
               toBinary(
@@ -184,6 +187,7 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
     refreshUrl: `http://127.0.0.1:${refreshPort}/auth/exchange_user_api_key`,
     setDiscoveryMode(mode) {
       discoveryMode = mode;
+      transientFailuresRemaining = mode === "transient-empty" ? 1 : 0;
     },
     setDiscoveredModels(models) {
       discoveredModels = models;
@@ -576,6 +580,60 @@ async function testDiscoveryFallbackAndSuccess(
   console.log("[test] Discovery fallback and success OK");
 }
 
+async function testDiscoveryRetriesTransientFailure(
+  modules: TestModules,
+  backend: TestCursorBackend,
+) {
+  console.log("[test] Testing discovery retry after transient failure...");
+  modules.clearModelCache();
+  backend.resetObservations();
+  backend.setDiscoveryMode("transient-empty");
+  backend.setDiscoveredModels([
+    { id: "composer-2.5", name: "Composer 2.5", reasoning: true },
+  ]);
+
+  const models = await modules.getCursorModels(makeJwt(Math.floor(Date.now() / 1000) + 3600));
+  assertArrayEqual(
+    models.map((model) => model.id),
+    ["composer-2.5"],
+    "Expected discovery to retry and return the second successful response",
+  );
+  assertEqual(
+    backend.getDiscoveryRequestBodies().length,
+    2,
+    "Expected transient discovery failure to be retried once",
+  );
+  console.log("[test] Discovery retry after transient failure OK");
+}
+
+async function testProviderAllowListFallbackWarns(modules: TestModules) {
+  console.log("[test] Testing provider allow-list fallback warning...");
+  const prevAllowList = process.env.CURSOR_MODELS;
+  process.env.CURSOR_MODELS = "composer-2.5";
+  const messages: string[] = [];
+  const originalError = console.error;
+  console.error = (...args: unknown[]) => messages.push(args.map(String).join(" "));
+  try {
+    const provider = modules.buildProviderBlock(12345, [
+      { id: "composer-1.5", name: "Composer 1.5" },
+    ]) as { models?: Record<string, unknown> };
+    assertArrayEqual(
+      Object.keys(provider.models ?? {}),
+      ["composer-1.5"],
+      "Expected provider fallback to keep a non-empty model list",
+    );
+    assert(
+      messages.some((message) => message.includes("CURSOR_MODELS") && message.includes("composer-2.5")),
+      `Expected allow-list fallback warning, got ${JSON.stringify(messages)}`,
+    );
+  } finally {
+    console.error = originalError;
+    if (prevAllowList === undefined) delete process.env.CURSOR_MODELS;
+    else process.env.CURSOR_MODELS = prevAllowList;
+  }
+  console.log("[test] Provider allow-list fallback warning OK");
+}
+
 async function testFixedPortReuse(modules: TestModules) {
   // Regression: EADDRINUSE "Failed to start server. Is port 32125 in use?".
   // A second startProxy call on the SAME fixed port must REUSE the running
@@ -843,6 +901,8 @@ async function main() {
     await testArrayContentParsing(modules);
     await testExpiredTokenRefreshBeforeDiscovery(modules, backend);
     await testDiscoveryFallbackAndSuccess(modules, backend);
+    await testDiscoveryRetriesTransientFailure(modules, backend);
+    await testProviderAllowListFallbackWarns(modules);
     console.log("\n✓ All smoke tests passed");
     process.exitCode = 0;
   } catch (err) {

@@ -47,6 +47,10 @@ const FALLBACK_MODELS: CursorModel[] = [
   // Composer models
   { id: "composer-1", name: "Composer 1", reasoning: true, contextWindow: 200_000, maxTokens: 64_000 },
   { id: "composer-1.5", name: "Composer 1.5", reasoning: true, contextWindow: 200_000, maxTokens: 64_000 },
+  { id: "composer-2", name: "Composer 2", reasoning: true, contextWindow: 200_000, maxTokens: 64_000 },
+  { id: "composer-2-fast", name: "Composer 2 Fast", reasoning: true, contextWindow: 200_000, maxTokens: 64_000 },
+  { id: "composer-2.5", name: "Composer 2.5", reasoning: true, contextWindow: 200_000, maxTokens: 64_000 },
+  { id: "composer-2.5-fast", name: "Composer 2.5 Fast", reasoning: true, contextWindow: 200_000, maxTokens: 64_000 },
   // Claude models
   { id: "claude-4.6-opus-high", name: "Claude 4.6 Opus", reasoning: true, contextWindow: 200_000, maxTokens: 128_000 },
   { id: "claude-4.6-sonnet-medium", name: "Claude 4.6 Sonnet", reasoning: true, contextWindow: 200_000, maxTokens: 64_000 },
@@ -63,6 +67,18 @@ const FALLBACK_MODELS: CursorModel[] = [
 ];
 
 async function fetchCursorUsableModels(
+  apiKey: string,
+): Promise<CursorModel[] | null> {
+  const attempts = 3;
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    const models = await fetchCursorUsableModelsOnce(apiKey);
+    if (models && models.length > 0) return models;
+    if (attempt < attempts) await Bun.sleep(50 * attempt);
+  }
+  return null;
+}
+
+async function fetchCursorUsableModelsOnce(
   apiKey: string,
 ): Promise<CursorModel[] | null> {
   try {
@@ -97,6 +113,9 @@ export async function getCursorModels(
   if (cachedModels) return cachedModels;
   const discovered = await fetchCursorUsableModels(apiKey);
   cachedModels = discovered && discovered.length > 0 ? discovered : FALLBACK_MODELS;
+  if (!discovered || discovered.length === 0) {
+    console.error(`[cursor-oauth] model discovery failed; using ${FALLBACK_MODELS.length} fallback models`);
+  }
   return cachedModels;
 }
 
