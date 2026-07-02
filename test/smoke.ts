@@ -1,8 +1,12 @@
 import http from "node:http";
 import http2 from "node:http2";
 import type { AddressInfo } from "node:net";
-import { create, toBinary } from "@bufbuild/protobuf";
+import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
 import {
+  AgentClientMessageSchema,
+  ConversationStepSchema,
+  ConversationTurnStructureSchema,
+  UserMessageSchema,
   GetUsableModelsResponseSchema,
   ModelDetailsSchema,
 } from "../src/proto/agent_pb";
@@ -15,11 +19,13 @@ interface TestModules {
   getProxyPort: typeof import("../src/proxy").getProxyPort;
   deriveConversationKey: typeof import("../src/proxy").deriveConversationKey;
   deriveConversationId: typeof import("../src/proxy").deriveConversationId;
+  buildCursorRequestForTest: typeof import("../src/proxy").buildCursorRequestForTest;
   generateCursorAuthParams: typeof import("../src/auth").generateCursorAuthParams;
   getTokenExpiry: typeof import("../src/auth").getTokenExpiry;
   CursorAuthPlugin: typeof import("../src/index").CursorAuthPlugin;
   getCursorModels: typeof import("../src/models").getCursorModels;
   clearModelCache: typeof import("../src/models").clearModelCache;
+  buildProviderBlock: typeof import("../src/standalone").buildProviderBlock;
 }
 
 interface TestCursorBackend {
@@ -214,18 +220,60 @@ async function loadModules(): Promise<TestModules> {
   const auth = await import("../src/auth");
   const index = await import("../src/index");
   const models = await import("../src/models");
+  const standalone = await import("../src/standalone");
   return {
     startProxy: proxy.startProxy,
     stopProxy: proxy.stopProxy,
     getProxyPort: proxy.getProxyPort,
     deriveConversationKey: proxy.deriveConversationKey,
     deriveConversationId: proxy.deriveConversationId,
+    buildCursorRequestForTest: proxy.buildCursorRequestForTest,
     generateCursorAuthParams: auth.generateCursorAuthParams,
     getTokenExpiry: auth.getTokenExpiry,
     CursorAuthPlugin: index.CursorAuthPlugin,
     getCursorModels: models.getCursorModels,
     clearModelCache: models.clearModelCache,
+    buildProviderBlock: standalone.buildProviderBlock,
   };
+}
+
+function decodePriorTurnFromBlobStore(
+  modules: TestModules,
+  turns: Array<{ userText: string; assistantText: string }>,
+): { stateTurns: number; userText: string; assistantText: string; storeSize: number } {
+  const payload = modules.buildCursorRequestForTest(
+    "composer-2.5",
+    "system prompt",
+    "current user",
+    turns,
+    "11111111-1111-4111-8111-111111111111",
+    null,
+  );
+  const client = fromBinary(AgentClientMessageSchema, payload.requestBytes);
+  assert(client.message.case === "runRequest", "Expected runRequest client message");
+  const state = client.message.value.conversationState;
+  assert(state, "Expected conversation state");
+  assertEqual(state.turns.length, turns.length, "Expected serialized prior turn count");
+  const turnId = state.turns[0];
+  assert(turnId, "Expected first prior-turn blob id");
+  const turnBlob = payload.blobStore.get(Buffer.from(turnId).toString("hex"));
+  assert(turnBlob, "Expected prior turn blob to be stored for KV getBlob");
+  const turn = fromBinary(ConversationTurnStructureSchema, turnBlob);
+  assert(turn.turn.case === "agentConversationTurn", "Expected agent conversation turn");
+  const agentTurn = turn.turn.value;
+  const userBlob = payload.blobStore.get(Buffer.from(agentTurn.userMessage).toString("hex"));
+  assert(userBlob, "Expected nested prior user-message blob to be stored");
+  const user = fromBinary(UserMessageSchema, userBlob);
+  let assistantText = "";
+  const stepId = agentTurn.steps[0];
+  if (stepId) {
+    const stepBlob = payload.blobStore.get(Buffer.from(stepId).toString("hex"));
+    assert(stepBlob, "Expected nested prior assistant-step blob to be stored");
+    const step = fromBinary(ConversationStepSchema, stepBlob);
+    assert(step.message.case === "assistantMessage", "Expected assistant-message step");
+    assistantText = step.message.value.text;
+  }
+  return { stateTurns: state.turns.length, userText: user.text, assistantText, storeSize: payload.blobStore.size };
 }
 
 async function testProxyStartStop(modules: TestModules) {
@@ -616,6 +664,40 @@ async function testConversationKeyIsolation(modules: TestModules) {
   console.log("[test] Conversation-key isolation OK");
 }
 
+async function testTitlePriorTurnBlobsAreStored(modules: TestModules) {
+  console.log("[test] Testing title-shaped prior-turn blob storage...");
+  const decoded = decodePriorTurnFromBlobStore(modules, [
+    { userText: "Generate a title for this conversation:\n", assistantText: "" },
+  ]);
+  assertEqual(decoded.stateTurns, 1, "Title-shaped request should serialize one prior turn");
+  assertEqual(
+    decoded.userText,
+    "Generate a title for this conversation:\n",
+    "Stored prior-turn user blob should decode to the synthetic title prompt",
+  );
+  assert(decoded.storeSize >= 3, "Expected system, prior user, and prior turn blobs in the store");
+  console.log("[test] Title-shaped prior-turn blob storage OK");
+}
+
+async function testCheckpointlessContinuedTurnBlobsAreStored(modules: TestModules) {
+  console.log("[test] Testing checkpointless continued-turn blob storage...");
+  const decoded = decodePriorTurnFromBlobStore(modules, [
+    { userText: "inspect the repo", assistantText: "I will inspect it with a tool call." },
+  ]);
+  assertEqual(decoded.stateTurns, 1, "Continued request should serialize one historical turn");
+  assertEqual(
+    decoded.userText,
+    "inspect the repo",
+    "Stored historical user-message blob should decode to turn 1 user text",
+  );
+  assertEqual(
+    decoded.assistantText,
+    "I will inspect it with a tool call.",
+    "Stored historical assistant-step blob should decode to turn 1 assistant text",
+  );
+  console.log("[test] Checkpointless continued-turn blob storage OK");
+}
+
 async function testConversationIdProcessUniqueness(modules: TestModules) {
   // Regression: "Connect error internal: Blob not found" persisted even after
   // the system-prompt-fingerprint fix. Root cause: the conversation ID was a
@@ -751,6 +833,8 @@ async function main() {
     await testProxyStartStop(modules);
     await testFixedPortReuse(modules);
     await testConversationKeyIsolation(modules);
+    await testTitlePriorTurnBlobsAreStored(modules);
+    await testCheckpointlessContinuedTurnBlobsAreStored(modules);
     await testConversationIdProcessUniqueness(modules);
     await testProxyVersionGuardEvictsOlder(modules);
     await testAuthParams(modules);

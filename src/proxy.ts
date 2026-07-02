@@ -863,10 +863,7 @@ function buildCursorRequest(
   // System prompt → blob store (Cursor requests it back via KV handshake)
   const systemJson = JSON.stringify({ role: "system", content: systemPrompt });
   const systemBytes = new TextEncoder().encode(systemJson);
-  const systemBlobId = new Uint8Array(
-    createHash("sha256").update(systemBytes).digest(),
-  );
-  blobStore.set(Buffer.from(systemBlobId).toString("hex"), systemBytes);
+  const systemBlobId = storeBlob(blobStore, systemBytes);
 
   if (process.env.CURSOR_PROXY_DEBUG_BLOB) {
     console.error(
@@ -886,6 +883,7 @@ function buildCursorRequest(
         messageId: crypto.randomUUID(),
       });
       const userMsgBytes = toBinary(UserMessageSchema, userMsg);
+      const userMsgBlobId = storeBlob(blobStore, userMsgBytes);
 
       const stepBytes: Uint8Array[] = [];
       if (turn.assistantText) {
@@ -895,17 +893,17 @@ function buildCursorRequest(
             value: create(AssistantMessageSchema, { text: turn.assistantText }),
           },
         });
-        stepBytes.push(toBinary(ConversationStepSchema, step));
+        stepBytes.push(storeBlob(blobStore, toBinary(ConversationStepSchema, step)));
       }
 
       const agentTurn = create(AgentConversationTurnStructureSchema, {
-        userMessage: userMsgBytes,
+        userMessage: userMsgBlobId,
         steps: stepBytes,
       });
       const turnStructure = create(ConversationTurnStructureSchema, {
         turn: { case: "agentConversationTurn", value: agentTurn },
       });
-      turnBytes.push(toBinary(ConversationTurnStructureSchema, turnStructure));
+      turnBytes.push(storeBlob(blobStore, toBinary(ConversationTurnStructureSchema, turnStructure)));
     }
 
     conversationState = create(ConversationStateStructureSchema, {
@@ -958,6 +956,15 @@ function buildCursorRequest(
     mcpTools: [],
   };
 }
+
+function storeBlob(blobStore: Map<string, Uint8Array>, bytes: Uint8Array): Uint8Array {
+  const blobId = new Uint8Array(createHash("sha256").update(bytes).digest());
+  blobStore.set(Buffer.from(blobId).toString("hex"), bytes);
+  return blobId;
+}
+
+/** @internal Test-only. */
+export const buildCursorRequestForTest = buildCursorRequest;
 
 function parseConnectEndStream(data: Uint8Array): Error | null {
   try {
