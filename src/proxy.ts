@@ -71,7 +71,7 @@ import { resolve as pathResolve } from "node:path";
 import { statSync } from "node:fs";
 
 const CURSOR_API_URL = process.env.CURSOR_API_URL ?? "https://api2.cursor.sh";
-const CONNECT_END_STREAM_FLAG = 0b00000010;
+export const CONNECT_END_STREAM_FLAG = 0b00000010;
 const BRIDGE_PATH = pathResolve(import.meta.dir, "h2-bridge.mjs");
 
 /** Build stamp = mtime (ms) of THIS module's own file. A freshly-rebuilt proxy
@@ -99,6 +99,21 @@ const SSE_HEADERS = {
   "Cache-Control": "no-cache",
   Connection: "keep-alive",
 } as const;
+
+// Bun.serve's idleTimeout is hard-capped at 255s (oven-sh/bun#27470) — Bun
+// itself, not Cursor or opencode, severs a connection that goes that long
+// without an outbound byte. A Cursor turn that thinks silently for longer
+// than that (slow tool-result processing, backend load) had its SSE
+// connection to opencode killed mid-turn, surfacing to opencode as
+// "AI_APICallError: socket connection was closed unexpectedly". opencode
+// retries, but the retry replays a checkpoint/blobStore pairing Cursor's
+// server may already have moved past — one more path to "Blob not found".
+// Pinging well under Bun's ceiling keeps the connection looking alive for the
+// whole duration of a legitimately slow turn.
+let SSE_KEEPALIVE_MS = 20_000;
+export function setSseKeepAliveMsForTest(ms: number): void {
+  SSE_KEEPALIVE_MS = ms;
+}
 
 interface OpenAIToolCall {
   id: string;
@@ -157,7 +172,7 @@ interface PendingExec {
 
 /** A bridge kept alive across requests for tool result continuation. */
 interface ActiveBridge {
-  bridge: ReturnType<typeof spawnBridge>;
+  bridge: StreamBridge;
   heartbeatTimer: NodeJS.Timeout;
   blobStore: Map<string, Uint8Array>;
   mcpTools: McpToolDefinition[];
@@ -197,8 +212,20 @@ export function getStoredConversationIdForTest(convKey: string): string {
   return getOrCreateStoredConversation(convKey).conversationId;
 }
 
-export function evictStoredConversationForTest(convKey: string): void {
+/** Discard local state for a conversation we can no longer trust: Cursor
+ *  rejected the last turn (any Connect end-stream error — "Blob not found" or
+ *  otherwise), or the client disconnected before a turn reached a clean
+ *  terminal state. The next request for this convKey mints a fresh
+ *  conversationId (see getOrCreateStoredConversation) instead of replaying a
+ *  checkpoint/blobStore pairing Cursor's server may have already moved past.
+ *  Turns any Blob-not-found-class error into a one-turn hiccup instead of a
+ *  conversation wedged for the rest of the proxy process's lifetime. */
+function poisonStoredConversation(convKey: string): void {
   conversationStates.delete(convKey);
+}
+
+export function evictStoredConversationForTest(convKey: string): void {
+  poisonStoredConversation(convKey);
 }
 
 function evictStaleConversations(): void {
@@ -239,6 +266,23 @@ interface SpawnBridgeOptions {
   unary?: boolean;
 }
 
+/** Narrow view of a spawned bridge used by response-streaming code. Omits
+ *  `proc` (only `callCursorUnaryRpc`'s own timeout guard needs direct process
+ *  control, and it closes over its own `spawnBridge()` result directly).
+ *  Exported so tests can drive `createBridgeStreamResponseForTest` /
+ *  `collectFullResponseForTest` with a fake bridge — no real child process or
+ *  H2 connection required. */
+export interface StreamBridge {
+  write: (data: Uint8Array) => void;
+  end: () => void;
+  onData: (cb: (chunk: Buffer) => void) => void;
+  onClose: (cb: (code: number) => void) => void;
+  /** True while the bridge subprocess is still running. */
+  get alive(): boolean;
+  /** Kill the underlying bridge subprocess immediately. */
+  kill: () => void;
+}
+
 function spawnBridge(options: SpawnBridgeOptions): {
   proc: ReturnType<typeof Bun.spawn>;
   write: (data: Uint8Array) => void;
@@ -247,6 +291,7 @@ function spawnBridge(options: SpawnBridgeOptions): {
   onClose: (cb: (code: number) => void) => void;
   /** True while the bridge subprocess is still running. */
   get alive(): boolean;
+  kill: () => void;
 } {
   const proc = Bun.spawn(["node", BRIDGE_PATH], {
     stdin: "pipe",
@@ -319,6 +364,9 @@ function spawnBridge(options: SpawnBridgeOptions): {
       } else {
         cbs.close = cb;
       }
+    },
+    kill() {
+      try { proc.kill(); } catch {}
     },
   };
 }
@@ -1438,7 +1486,7 @@ export function deriveConversationKey(messages: OpenAIMessage[]): string {
 
 /** Create an SSE streaming Response that reads from a live bridge. */
 function createBridgeStreamResponse(
-  bridge: ReturnType<typeof spawnBridge>,
+  bridge: StreamBridge,
   heartbeatTimer: NodeJS.Timeout,
   blobStore: Map<string, Uint8Array>,
   mcpTools: McpToolDefinition[],
@@ -1448,11 +1496,17 @@ function createBridgeStreamResponse(
 ): Response {
   const completionId = `chatcmpl-${crypto.randomUUID().replace(/-/g, "").slice(0, 28)}`;
   const created = Math.floor(Date.now() / 1000);
+  let closed = false;
+  let keepAliveTimer: ReturnType<typeof setInterval> | undefined;
+
+  const cleanupTimers = () => {
+    clearInterval(heartbeatTimer);
+    if (keepAliveTimer) clearInterval(keepAliveTimer);
+  };
 
   const stream = new ReadableStream({
     start(controller) {
       const encoder = new TextEncoder();
-      let closed = false;
       const sendSSE = (data: object) => {
         if (closed) return;
         controller.enqueue(encoder.encode(`data: ${JSON.stringify(data)}\n\n`));
@@ -1466,6 +1520,17 @@ function createBridgeStreamResponse(
         closed = true;
         controller.close();
       };
+
+      // Bun's SSE connection to opencode has its own idle ceiling, separate
+      // from the Cursor-facing heartbeat below — see SSE_KEEPALIVE_MS.
+      keepAliveTimer = setInterval(() => {
+        if (closed) return;
+        try {
+          controller.enqueue(encoder.encode(": keep-alive\n\n"));
+        } catch {
+          // Controller already erroring/closing; cancel() will clean up.
+        }
+      }, SSE_KEEPALIVE_MS);
 
       const makeChunk = (
         delta: Record<string, unknown>,
@@ -1572,6 +1637,7 @@ function createBridgeStreamResponse(
         (endStreamBytes) => {
           const endError = parseConnectEndStream(endStreamBytes);
           if (endError) {
+            poisonStoredConversation(convKey);
             sendSSE(makeChunk({ content: `\n[Error: ${endError.message}]` }));
           }
         },
@@ -1580,7 +1646,7 @@ function createBridgeStreamResponse(
       bridge.onData(processChunk);
 
       bridge.onClose((code) => {
-        clearInterval(heartbeatTimer);
+        cleanupTimers();
         const stored = conversationStates.get(convKey);
         if (stored) {
           for (const [k, v] of blobStore) stored.blobStore.set(k, v);
@@ -1607,10 +1673,27 @@ function createBridgeStreamResponse(
         }
       });
     },
+    cancel() {
+      // The client (opencode) disconnected, or Bun's idleTimeout severed the
+      // connection, before we reached a clean terminal state — `closed` is
+      // only true here if neither the tool_calls path nor the stop/error path
+      // ran first (both set it before this could matter). Whatever Cursor was
+      // doing for this turn is now unobservable to us: stop leaking the
+      // bridge + timers, and don't let the next attempt trust local state
+      // Cursor's server may have already moved past.
+      if (closed) return;
+      closed = true;
+      cleanupTimers();
+      bridge.kill();
+      poisonStoredConversation(convKey);
+    },
   });
 
   return new Response(stream, { headers: SSE_HEADERS });
 }
+
+/** @internal Test-only. */
+export const createBridgeStreamResponseForTest = createBridgeStreamResponse;
 
 /** Spawn a bridge, send the initial request frame, and start heartbeat. */
 function startBridge(
@@ -1743,11 +1826,12 @@ async function collectFullResponse(
   payload: CursorRequestPayload,
   accessToken: string,
   convKey: string,
+  bridgeOverride?: { bridge: StreamBridge; heartbeatTimer: NodeJS.Timeout },
 ): Promise<CollectedResponse> {
   const { promise, resolve } = Promise.withResolvers<CollectedResponse>();
   let fullText = "";
 
-  const { bridge, heartbeatTimer } = startBridge(accessToken, payload.requestBytes);
+  const { bridge, heartbeatTimer } = bridgeOverride ?? startBridge(accessToken, payload.requestBytes);
 
   const state: StreamState = {
     toolCallIndex: 0,
@@ -1796,21 +1880,28 @@ async function collectFullResponse(
 
   bridge.onClose(() => {
     clearInterval(heartbeatTimer);
-    const stored = conversationStates.get(convKey);
-    if (stored) {
-      for (const [k, v] of payload.blobStore) stored.blobStore.set(k, v);
-      stored.lastAccessMs = Date.now();
-    }
     const flushed = tagFilter.flush();
     fullText += flushed.content;
 
     // Surface a real upstream error instead of silently returning an empty
     // body (which would otherwise become a blank title / empty completion).
-    if (endStreamError && !fullText) {
-      if (process.env.CURSOR_PROXY_DEBUG_BLOB) {
-        console.error(`[blob] end-stream error became content: ${endStreamError.message}`);
+    if (endStreamError) {
+      // Cursor rejected this conversation's state (e.g. "Blob not found").
+      // Poison it so the next turn mints a fresh conversationId instead of
+      // repeating the same mismatch forever.
+      poisonStoredConversation(convKey);
+      if (!fullText) {
+        if (process.env.CURSOR_PROXY_DEBUG_BLOB) {
+          console.error(`[blob] end-stream error became content: ${endStreamError.message}`);
+        }
+        fullText = `[Error: ${endStreamError.message}]`;
       }
-      fullText = `[Error: ${endStreamError.message}]`;
+    } else {
+      const stored = conversationStates.get(convKey);
+      if (stored) {
+        for (const [k, v] of payload.blobStore) stored.blobStore.set(k, v);
+        stored.lastAccessMs = Date.now();
+      }
     }
 
     const usage = computeUsage(state);
@@ -1822,3 +1913,6 @@ async function collectFullResponse(
 
   return promise;
 }
+
+/** @internal Test-only. */
+export const collectFullResponseForTest = collectFullResponse;

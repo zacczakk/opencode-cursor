@@ -2,6 +2,7 @@ import http from "node:http";
 import http2 from "node:http2";
 import type { AddressInfo } from "node:net";
 import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
+import type { StreamBridge } from "../src/proxy";
 import {
   AgentClientMessageSchema,
   ConversationStepSchema,
@@ -21,6 +22,10 @@ interface TestModules {
   getStoredConversationIdForTest: typeof import("../src/proxy").getStoredConversationIdForTest;
   evictStoredConversationForTest: typeof import("../src/proxy").evictStoredConversationForTest;
   buildCursorRequestForTest: typeof import("../src/proxy").buildCursorRequestForTest;
+  createBridgeStreamResponseForTest: typeof import("../src/proxy").createBridgeStreamResponseForTest;
+  collectFullResponseForTest: typeof import("../src/proxy").collectFullResponseForTest;
+  setSseKeepAliveMsForTest: typeof import("../src/proxy").setSseKeepAliveMsForTest;
+  CONNECT_END_STREAM_FLAG: typeof import("../src/proxy").CONNECT_END_STREAM_FLAG;
   generateCursorAuthParams: typeof import("../src/auth").generateCursorAuthParams;
   getTokenExpiry: typeof import("../src/auth").getTokenExpiry;
   CursorAuthPlugin: typeof import("../src/index").CursorAuthPlugin;
@@ -234,6 +239,10 @@ async function loadModules(): Promise<TestModules> {
     getStoredConversationIdForTest: proxy.getStoredConversationIdForTest,
     evictStoredConversationForTest: proxy.evictStoredConversationForTest,
     buildCursorRequestForTest: proxy.buildCursorRequestForTest,
+    createBridgeStreamResponseForTest: proxy.createBridgeStreamResponseForTest,
+    collectFullResponseForTest: proxy.collectFullResponseForTest,
+    setSseKeepAliveMsForTest: proxy.setSseKeepAliveMsForTest,
+    CONNECT_END_STREAM_FLAG: proxy.CONNECT_END_STREAM_FLAG,
     generateCursorAuthParams: auth.generateCursorAuthParams,
     getTokenExpiry: auth.getTokenExpiry,
     CursorAuthPlugin: index.CursorAuthPlugin,
@@ -805,6 +814,228 @@ async function testConversationIdScopedToStoredConversationLifetime(modules: Tes
   console.log("[test] Conversation-ID StoredConversation lifetime scope OK");
 }
 
+/** Build a fake StreamBridge for testing response-streaming code without a
+ *  real child process or H2 connection. Captures the onData/onClose
+ *  callbacks so a test can drive them directly. */
+function makeFakeStreamBridge(): {
+  bridge: StreamBridge;
+  killed: () => boolean;
+  triggerData: (bytes: Uint8Array) => void;
+  triggerClose: (code: number) => void;
+} {
+  let onDataCb: ((chunk: Buffer) => void) | null = null;
+  let onCloseCb: ((code: number) => void) | null = null;
+  let killedFlag = false;
+  const bridge: StreamBridge = {
+    write() {},
+    end() {},
+    onData(cb) {
+      onDataCb = cb;
+    },
+    onClose(cb) {
+      onCloseCb = cb;
+    },
+    get alive() {
+      return !killedFlag;
+    },
+    kill() {
+      killedFlag = true;
+    },
+  };
+  return {
+    bridge,
+    killed: () => killedFlag,
+    triggerData: (bytes) => onDataCb?.(Buffer.from(bytes)),
+    triggerClose: (code) => onCloseCb?.(code),
+  };
+}
+
+/** Frame a Connect end-stream error matching proxy.ts's wire format:
+ *  [1-byte flags with CONNECT_END_STREAM_FLAG set][4-byte BE length][JSON]. */
+function frameConnectEndStreamError(modules: TestModules, message: string): Buffer {
+  const payload = Buffer.from(JSON.stringify({ error: { code: "internal", message } }), "utf8");
+  const frame = Buffer.alloc(5 + payload.length);
+  frame[0] = modules.CONNECT_END_STREAM_FLAG;
+  frame.writeUInt32BE(payload.length, 1);
+  frame.set(payload, 5);
+  return frame;
+}
+
+async function readSseText(response: Response): Promise<string> {
+  const reader = response.body!.getReader();
+  const decoder = new TextDecoder();
+  let text = "";
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    text += decoder.decode(value, { stream: true });
+  }
+  return text;
+}
+
+async function testEndStreamErrorPoisonsConversationStreaming(modules: TestModules) {
+  // Regression: the 5th "Blob not found" mechanism. Bun.serve's idleTimeout
+  // is hard-capped at 255s (oven-sh/bun#27470) — a Cursor turn that thinks
+  // silently for longer than that gets its SSE connection to opencode killed
+  // by Bun itself, opencode retries, and the retry replayed a
+  // checkpoint/blobStore pairing Cursor's server had already moved past —
+  // surfacing as a fresh "Blob not found". More generally: ANY Connect
+  // end-stream error means local state no longer matches what Cursor's
+  // server expects, so it must not be replayed on the next turn.
+  console.log("[test] Testing end-stream error poisons conversation (streaming)...");
+  const convKey = "streaming-poison-test-key";
+  const bridgeKey = "streaming-poison-bridge-key";
+  const before = modules.getStoredConversationIdForTest(convKey);
+
+  const fake = makeFakeStreamBridge();
+  const heartbeatTimer = setInterval(() => {}, 60_000);
+  const response = modules.createBridgeStreamResponseForTest(
+    fake.bridge,
+    heartbeatTimer,
+    new Map(),
+    [],
+    "composer-2.5",
+    bridgeKey,
+    convKey,
+  );
+
+  fake.triggerData(frameConnectEndStreamError(modules, "Blob not found"));
+  fake.triggerClose(0);
+
+  const text = await readSseText(response);
+  assert(
+    text.includes("Blob not found"),
+    `Expected the end-stream error to surface as SSE content, got: ${text}`,
+  );
+
+  const after = modules.getStoredConversationIdForTest(convKey);
+  assert(
+    after !== before,
+    `A Connect end-stream error must poison the StoredConversation (both got ${before}) — ` +
+      `otherwise the next turn replays the same mismatched state forever`,
+  );
+
+  console.log("[test] End-stream error poisons conversation (streaming) OK");
+}
+
+async function testEndStreamErrorPoisonsConversationNonStreaming(modules: TestModules) {
+  console.log("[test] Testing end-stream error poisons conversation (non-streaming)...");
+  const convKey = "non-streaming-poison-test-key";
+  const before = modules.getStoredConversationIdForTest(convKey);
+
+  const fake = makeFakeStreamBridge();
+  const heartbeatTimer = setInterval(() => {}, 60_000);
+  const resultPromise = modules.collectFullResponseForTest(
+    { requestBytes: new Uint8Array(), blobStore: new Map(), mcpTools: [] },
+    "test-token",
+    convKey,
+    { bridge: fake.bridge, heartbeatTimer },
+  );
+
+  fake.triggerData(frameConnectEndStreamError(modules, "Blob not found"));
+  fake.triggerClose(0);
+
+  const result = await resultPromise;
+  assert(
+    result.text.includes("Blob not found"),
+    `Expected the end-stream error surfaced as content, got: ${result.text}`,
+  );
+
+  const after = modules.getStoredConversationIdForTest(convKey);
+  assert(
+    after !== before,
+    `A Connect end-stream error must poison the StoredConversation (both got ${before})`,
+  );
+
+  console.log("[test] End-stream error poisons conversation (non-streaming) OK");
+}
+
+async function testCancelBeforeTerminalStateKillsBridgeAndPoisons(modules: TestModules) {
+  // Regression: opencode (or Bun's own idleTimeout) can tear down the SSE
+  // response before a turn ever reaches a clean terminal state (no
+  // tool_calls, no stop). Without a cancel() handler, the bridge subprocess +
+  // heartbeat leaked forever, and the next retry replayed local state Cursor's
+  // server had no reason to still honor.
+  console.log("[test] Testing stream cancel before terminal state kills bridge + poisons...");
+  const convKey = "cancel-poison-test-key";
+  const bridgeKey = "cancel-poison-bridge-key";
+  const before = modules.getStoredConversationIdForTest(convKey);
+
+  const fake = makeFakeStreamBridge();
+  const heartbeatTimer = setInterval(() => {}, 60_000);
+  const response = modules.createBridgeStreamResponseForTest(
+    fake.bridge,
+    heartbeatTimer,
+    new Map(),
+    [],
+    "composer-2.5",
+    bridgeKey,
+    convKey,
+  );
+
+  // Nothing has streamed yet — simulate the client/Bun giving up mid-turn.
+  await response.body!.cancel();
+
+  assert(fake.killed(), "cancel() before a terminal state must kill the bridge subprocess");
+
+  const after = modules.getStoredConversationIdForTest(convKey);
+  assert(
+    after !== before,
+    `A cancelled mid-flight turn must poison the StoredConversation (both got ${before}) — ` +
+      `the next retry must not replay state Cursor's server may have moved past`,
+  );
+
+  console.log("[test] Stream cancel before terminal state OK");
+}
+
+async function testKeepAlivePingsDuringSilence(modules: TestModules) {
+  // Regression: the underlying trigger for the 5th mechanism above. Bun.serve
+  // enforces idleTimeout=255 (its hard-capped max) on the SSE connection to
+  // opencode; a Cursor turn silent for longer than that got disconnected by
+  // Bun itself. Ping well under that ceiling so Bun always sees activity.
+  console.log("[test] Testing SSE keep-alive pings during Cursor silence...");
+  modules.setSseKeepAliveMsForTest(15);
+  const heartbeatTimer = setInterval(() => {}, 60_000);
+  try {
+    const convKey = "keepalive-test-key";
+    const bridgeKey = "keepalive-test-bridge-key";
+    const fake = makeFakeStreamBridge();
+    const response = modules.createBridgeStreamResponseForTest(
+      fake.bridge,
+      heartbeatTimer,
+      new Map(),
+      [],
+      "composer-2.5",
+      bridgeKey,
+      convKey,
+    );
+
+    // Cursor stays silent (no triggerData) — only the keep-alive timer should
+    // produce output.
+    const reader = response.body!.getReader();
+    const decoder = new TextDecoder();
+    try {
+      const { value } = await Promise.race([
+        reader.read(),
+        new Promise<{ value?: Uint8Array }>((resolve) => setTimeout(() => resolve({}), 1_000)),
+      ]);
+      assert(value, "Expected the keep-alive timer to produce a chunk within 1s");
+      const text = decoder.decode(value);
+      assert(
+        text.includes(": keep-alive"),
+        `Expected an SSE keep-alive comment, got: ${JSON.stringify(text)}`,
+      );
+    } finally {
+      await reader.cancel();
+    }
+
+    console.log("[test] SSE keep-alive pings OK");
+  } finally {
+    clearInterval(heartbeatTimer);
+    modules.setSseKeepAliveMsForTest(20_000);
+  }
+}
+
 async function testProxyVersionGuardEvictsOlder(modules: TestModules) {
   // Regression: a fresh plugin build must be able to TAKE OVER the fixed port
   // from an OLDER cursor-oauth proxy still running there (a stale opencode window
@@ -1005,6 +1236,10 @@ async function main() {
     await testTitlePriorTurnBlobsAreStored(modules);
     await testCheckpointlessContinuedTurnBlobsAreStored(modules);
     await testConversationIdScopedToStoredConversationLifetime(modules);
+    await testEndStreamErrorPoisonsConversationStreaming(modules);
+    await testEndStreamErrorPoisonsConversationNonStreaming(modules);
+    await testCancelBeforeTerminalStateKillsBridgeAndPoisons(modules);
+    await testKeepAlivePingsDuringSilence(modules);
     await testProxyVersionGuardEvictsOlder(modules);
     await testSlowDrainEvictionBindsAfterPollTimeout(modules);
     await testStuckEvictionStillAdopts(modules);
