@@ -5,6 +5,7 @@ import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
 import type { StreamBridge } from "../src/proxy";
 import {
   AgentClientMessageSchema,
+  AgentServerMessageSchema,
   ConversationStepSchema,
   ConversationTurnStructureSchema,
   UserMessageSchema,
@@ -25,6 +26,7 @@ interface TestModules {
   createBridgeStreamResponseForTest: typeof import("../src/proxy").createBridgeStreamResponseForTest;
   collectFullResponseForTest: typeof import("../src/proxy").collectFullResponseForTest;
   setSseKeepAliveMsForTest: typeof import("../src/proxy").setSseKeepAliveMsForTest;
+  setGenerationStallMsForTest: typeof import("../src/proxy").setGenerationStallMsForTest;
   CONNECT_END_STREAM_FLAG: typeof import("../src/proxy").CONNECT_END_STREAM_FLAG;
   generateCursorAuthParams: typeof import("../src/auth").generateCursorAuthParams;
   getTokenExpiry: typeof import("../src/auth").getTokenExpiry;
@@ -242,6 +244,7 @@ async function loadModules(): Promise<TestModules> {
     createBridgeStreamResponseForTest: proxy.createBridgeStreamResponseForTest,
     collectFullResponseForTest: proxy.collectFullResponseForTest,
     setSseKeepAliveMsForTest: proxy.setSseKeepAliveMsForTest,
+    setGenerationStallMsForTest: proxy.setGenerationStallMsForTest,
     CONNECT_END_STREAM_FLAG: proxy.CONNECT_END_STREAM_FLAG,
     generateCursorAuthParams: auth.generateCursorAuthParams,
     getTokenExpiry: auth.getTokenExpiry,
@@ -861,6 +864,20 @@ function frameConnectEndStreamError(modules: TestModules, message: string): Buff
   return frame;
 }
 
+/** Frame a minimal, valid (non-end-stream) AgentServerMessage — a stand-in
+ *  for genuine Cursor activity in the generation-stall regression tests. No
+ *  oneof case is set, so it's a safe no-op through processServerMessage;
+ *  only its arrival (and the resulting timer reset) is under test. */
+function frameGenericServerMessage(): Buffer {
+  const msg = create(AgentServerMessageSchema, {});
+  const payload = toBinary(AgentServerMessageSchema, msg);
+  const frame = Buffer.alloc(5 + payload.length);
+  frame[0] = 0; // no CONNECT_END_STREAM_FLAG — an ordinary data frame
+  frame.writeUInt32BE(payload.length, 1);
+  frame.set(payload, 5);
+  return frame;
+}
+
 async function readSseText(response: Response): Promise<string> {
   const reader = response.body!.getReader();
   const decoder = new TextDecoder();
@@ -1033,6 +1050,144 @@ async function testKeepAlivePingsDuringSilence(modules: TestModules) {
   } finally {
     clearInterval(heartbeatTimer);
     modules.setSseKeepAliveMsForTest(20_000);
+  }
+}
+
+async function testGenerationStallPoisonsAndKillsBridgeStreaming(modules: TestModules) {
+  // Regression: 2026-07-07, a turn hung silently for 2h36m — Cursor sent one
+  // partial sentence then went completely dark (no tool call, no error, no
+  // more data). Root cause: h2-bridge.mjs's own kill-watchdog resets on ANY
+  // stdin write, including our own outbound clientHeartbeat every 5s, so it
+  // never actually measured "has Cursor responded" — only "are we still
+  // writing," which is always true. This app-level timer is the fix: reset
+  // only by genuine inbound AgentServerMessages, so real silence gets caught.
+  console.log("[test] Testing generation stall poisons + kills bridge (streaming)...");
+  modules.setGenerationStallMsForTest(25);
+  const heartbeatTimer = setInterval(() => {}, 60_000);
+  try {
+    const convKey = "generation-stall-streaming-test-key";
+    const bridgeKey = "generation-stall-streaming-bridge-key";
+    const before = modules.getStoredConversationIdForTest(convKey);
+
+    const fake = makeFakeStreamBridge();
+    const response = modules.createBridgeStreamResponseForTest(
+      fake.bridge,
+      heartbeatTimer,
+      new Map(),
+      [],
+      "composer-2.5",
+      bridgeKey,
+      convKey,
+    );
+
+    // Cursor never sends anything — no triggerData, no triggerClose. The
+    // stall timer alone must notice and tear the turn down.
+    const text = await readSseText(response);
+
+    assert(
+      text.includes("no response") && text.includes("25s"),
+      `Expected a stall error mentioning the timeout, got: ${text}`,
+    );
+    assert(
+      text.includes('"finish_reason":"stop"'),
+      `Expected a clean stop after the stall, got: ${text}`,
+    );
+    assert(fake.killed(), "A generation stall must kill the bridge subprocess");
+
+    const after = modules.getStoredConversationIdForTest(convKey);
+    assert(
+      after !== before,
+      `A generation stall must poison the StoredConversation (both got ${before}) — ` +
+        `otherwise the next retry replays state Cursor never acknowledged`,
+    );
+
+    console.log("[test] Generation stall poisons + kills bridge (streaming) OK");
+  } finally {
+    clearInterval(heartbeatTimer);
+    modules.setGenerationStallMsForTest(90_000);
+  }
+}
+
+async function testGenerationStallResolvesWithErrorNonStreaming(modules: TestModules) {
+  console.log("[test] Testing generation stall resolves with error (non-streaming)...");
+  modules.setGenerationStallMsForTest(25);
+  const heartbeatTimer = setInterval(() => {}, 60_000);
+  try {
+    const convKey = "generation-stall-non-streaming-test-key";
+    const before = modules.getStoredConversationIdForTest(convKey);
+
+    const fake = makeFakeStreamBridge();
+    const resultPromise = modules.collectFullResponseForTest(
+      { requestBytes: new Uint8Array(), blobStore: new Map(), mcpTools: [] },
+      "test-token",
+      convKey,
+      { bridge: fake.bridge, heartbeatTimer },
+    );
+
+    // Cursor never sends anything (this is the code path title-gen and
+    // model-discovery calls use — the same path that hung in the real
+    // incident's OTHER concurrent call).
+    const result = await resultPromise;
+
+    assert(
+      result.text.includes("no response"),
+      `Expected a stall error in the resolved text, got: ${result.text}`,
+    );
+    assert(fake.killed(), "A generation stall must kill the bridge subprocess");
+
+    const after = modules.getStoredConversationIdForTest(convKey);
+    assert(
+      after !== before,
+      `A generation stall must poison the StoredConversation (both got ${before})`,
+    );
+
+    console.log("[test] Generation stall resolves with error (non-streaming) OK");
+  } finally {
+    clearInterval(heartbeatTimer);
+    modules.setGenerationStallMsForTest(90_000);
+  }
+}
+
+async function testGenuineActivityPreventsFalseGenerationStall(modules: TestModules) {
+  // Regression-of-the-regression: the fix must reset on genuine Cursor
+  // activity, not just paper over the old bug with a slightly-less-wrong
+  // fixed budget. A legitimately slow-but-alive turn (real frames arriving
+  // slower than the old bug's masking heartbeat, but well inside the stall
+  // window of each other) must survive well past the nominal stall duration
+  // — and must still be caught once genuine activity actually stops.
+  console.log("[test] Testing genuine activity prevents a false generation-stall kill...");
+  modules.setGenerationStallMsForTest(25);
+  const heartbeatTimer = setInterval(() => {}, 60_000);
+  try {
+    const convKey = "generation-stall-activity-test-key";
+    const bridgeKey = "generation-stall-activity-bridge-key";
+    const fake = makeFakeStreamBridge();
+    modules.createBridgeStreamResponseForTest(
+      fake.bridge,
+      heartbeatTimer,
+      new Map(),
+      [],
+      "composer-2.5",
+      bridgeKey,
+      convKey,
+    );
+
+    // Real frames every 5ms — well inside the 25ms stall window — for
+    // 200ms total: 8x the nominal stall budget.
+    const pings = setInterval(() => fake.triggerData(frameGenericServerMessage()), 5);
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    clearInterval(pings);
+
+    assert(!fake.killed(), "Genuine periodic activity must not be treated as a stall");
+
+    // Now let it actually go quiet and confirm the timer still fires.
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    assert(fake.killed(), "Once genuine activity stops, the stall timer must still fire");
+
+    console.log("[test] Genuine activity prevents false generation-stall kill OK");
+  } finally {
+    clearInterval(heartbeatTimer);
+    modules.setGenerationStallMsForTest(90_000);
   }
 }
 
@@ -1240,6 +1395,9 @@ async function main() {
     await testEndStreamErrorPoisonsConversationNonStreaming(modules);
     await testCancelBeforeTerminalStateKillsBridgeAndPoisons(modules);
     await testKeepAlivePingsDuringSilence(modules);
+    await testGenerationStallPoisonsAndKillsBridgeStreaming(modules);
+    await testGenerationStallResolvesWithErrorNonStreaming(modules);
+    await testGenuineActivityPreventsFalseGenerationStall(modules);
     await testProxyVersionGuardEvictsOlder(modules);
     await testSlowDrainEvictionBindsAfterPollTimeout(modules);
     await testStuckEvictionStillAdopts(modules);

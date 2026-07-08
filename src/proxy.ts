@@ -115,6 +115,33 @@ export function setSseKeepAliveMsForTest(ms: number): void {
   SSE_KEEPALIVE_MS = ms;
 }
 
+// 2026-07-07: a turn hung silently for 2h36m — no tool call, no error, no
+// data — recovering only when something outside this process (the network
+// layer) finally reaped a dead connection. Root cause: h2-bridge.mjs's own
+// kill-watchdog resets on ANY stdin write, including the clientHeartbeat
+// ping above every 5s, so it never measured "has Cursor responded," only
+// "are we still writing" — which is always true. That watchdog is left
+// alone here: it correctly keeps the bridge alive across a *different*,
+// legitimate wait (a paused bridge sitting in activeBridges between a
+// tool_calls turn ending and opencode sending back a slow tool result, e.g.
+// a long-running bash command or a human answering the `question` tool —
+// which can and should take far longer than this).
+//
+// This timer instead lives at the application level, scoped only to "we are
+// still expecting Cursor to produce its own output for this turn" (inside
+// createBridgeStreamResponse / collectFullResponse, before any terminal
+// state). It resets ONLY on a genuine parsed AgentServerMessage — never on
+// our own outbound heartbeat. Empirically (2026-07-07 live probe against the
+// real backend: 7,033 messages / 75s trace, max gap 3.9s at startup, p99
+// 127ms, zero server-sent HeartbeatUpdate frames), a healthy turn never goes
+// quiet for more than a few seconds. 90s leaves generous margin above that
+// noise floor while still bounding the worst case to under two minutes
+// instead of two and a half hours.
+let GENERATION_STALL_MS = 90_000;
+export function setGenerationStallMsForTest(ms: number): void {
+  GENERATION_STALL_MS = ms;
+}
+
 interface OpenAIToolCall {
   id: string;
   type: "function";
@@ -1498,10 +1525,12 @@ function createBridgeStreamResponse(
   const created = Math.floor(Date.now() / 1000);
   let closed = false;
   let keepAliveTimer: ReturnType<typeof setInterval> | undefined;
+  let stallTimer: ReturnType<typeof setTimeout> | undefined;
 
   const cleanupTimers = () => {
     clearInterval(heartbeatTimer);
     if (keepAliveTimer) clearInterval(keepAliveTimer);
+    if (stallTimer) clearTimeout(stallTimer);
   };
 
   const stream = new ReadableStream({
@@ -1565,13 +1594,47 @@ function createBridgeStreamResponse(
 
       let mcpExecReceived = false;
 
+      // Cursor has gone silent for this turn: no content, no tool call, no
+      // stop, nothing — for GENERATION_STALL_MS straight. Treat it exactly
+      // like a Connect end-stream error (see the endStreamBytes handler
+      // below): poison the stored conversation so the next attempt mints a
+      // fresh one, kill the bridge, and surface a real error instead of
+      // hanging until something outside this process notices.
+      const onStall = () => {
+        if (closed) return;
+        poisonStoredConversation(convKey);
+        const flushed = tagFilter.flush();
+        if (flushed.reasoning) sendSSE(makeChunk({ reasoning_content: flushed.reasoning }));
+        if (flushed.content) sendSSE(makeChunk({ content: flushed.content }));
+        sendSSE(makeChunk({
+          content: `\n[Error: Cursor produced no response for ${GENERATION_STALL_MS / 1000}s — treating the connection as dead]`,
+        }));
+        sendSSE(makeChunk({}, "stop"));
+        sendSSE(makeUsageChunk());
+        sendDone();
+        closeController();
+        cleanupTimers();
+        bridge.kill();
+        activeBridges.delete(bridgeKey);
+      };
+      const resetStallTimer = () => {
+        if (stallTimer) clearTimeout(stallTimer);
+        stallTimer = setTimeout(onStall, GENERATION_STALL_MS);
+      };
+      resetStallTimer();
+
       const processChunk = createConnectFrameParser(
         (messageBytes) => {
+          if (closed) return;
+          resetStallTimer();
           try {
             const serverMessage = fromBinary(
               AgentServerMessageSchema,
               messageBytes,
             );
+            if (process.env.CURSOR_PROXY_DEBUG_STALL) {
+              console.error(`[stall-probe] t=${Date.now()} case=${serverMessage.message.case} bytes=${messageBytes.length}`);
+            }
             processServerMessage(
               serverMessage,
               blobStore,
@@ -1646,6 +1709,10 @@ function createBridgeStreamResponse(
       bridge.onData(processChunk);
 
       bridge.onClose((code) => {
+        // If onStall() already tore this turn down (killed the bridge itself
+        // to force this very callback), there's nothing left to do — timers
+        // are already cleared and the SSE response is already closed.
+        if (closed) return;
         cleanupTimers();
         const stored = conversationStates.get(convKey);
         if (stored) {
@@ -1841,14 +1908,41 @@ async function collectFullResponse(
   };
   const tagFilter = createThinkingTagFilter();
   let endStreamError: Error | null = null;
+  let stalled = false;
+  let stallTimer: ReturnType<typeof setTimeout> | undefined;
+
+  // See the matching comment in createBridgeStreamResponse / the
+  // GENERATION_STALL_MS definition above: this covers the non-streaming path
+  // (title generation, model discovery) with the same fix — reset only by a
+  // genuine parsed AgentServerMessage, never by our own outbound heartbeat.
+  const resetStallTimer = () => {
+    if (stallTimer) clearTimeout(stallTimer);
+    stallTimer = setTimeout(() => {
+      stalled = true;
+      poisonStoredConversation(convKey);
+      bridge.kill();
+      const flushed = tagFilter.flush();
+      fullText += flushed.content;
+      if (!fullText) {
+        fullText = `[Error: Cursor produced no response for ${GENERATION_STALL_MS / 1000}s — treating the connection as dead]`;
+      }
+      resolve({ text: fullText, usage: computeUsage(state) });
+    }, GENERATION_STALL_MS);
+  };
+  resetStallTimer();
 
   bridge.onData(createConnectFrameParser(
     (messageBytes) => {
+      if (stalled) return;
+      resetStallTimer();
       try {
         const serverMessage = fromBinary(
           AgentServerMessageSchema,
           messageBytes,
         );
+        if (process.env.CURSOR_PROXY_DEBUG_STALL) {
+          console.error(`[stall-probe] t=${Date.now()} case=${serverMessage.message.case} bytes=${messageBytes.length}`);
+        }
         processServerMessage(
           serverMessage,
           payload.blobStore,
@@ -1879,6 +1973,10 @@ async function collectFullResponse(
   ));
 
   bridge.onClose(() => {
+    // onStall's own timeout already resolved the promise and killed the
+    // bridge itself (to force this callback) — nothing left to do.
+    if (stalled) return;
+    if (stallTimer) clearTimeout(stallTimer);
     clearInterval(heartbeatTimer);
     const flushed = tagFilter.flush();
     fullText += flushed.content;
